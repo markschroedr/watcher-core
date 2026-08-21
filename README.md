@@ -8,9 +8,17 @@
   Watch any stream. Describe what matters. Stay quiet until it happens.
 </p>
 
-Watcher reads a file, command, or standard input. An LLM judges your condition.
-When it matches, Watcher emits a finding, sends a notification, or runs a
-verified action.
+Watcher is one small building block: **a stream plus a condition in plain words
+becomes an event.**
+
+It reads a file, a command's output, or standard input. An LLM checks your
+condition. When the condition is true, Watcher emits a finding, sends a
+notification, or runs a verified action.
+
+That one idea covers many jobs. The stream can be logs, prices, a sensor feed,
+an inbox, or any text. The condition is a sentence, not a regex. So the same
+tool can watch a deploy, flag a bad number, or wait for one specific event —
+without new code each time.
 
 ## Install
 
