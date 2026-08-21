@@ -5,20 +5,17 @@
 <h1 align="center">Watcher</h1>
 
 <p align="center">
-  Watch any stream. Describe what matters. Stay quiet until it happens.
+  Watch text. Say what to look for. Get an alert when it happens.
 </p>
 
-Watcher is one small building block: **a stream plus a condition in plain words
-becomes an event.**
+Watcher does three things:
 
-It reads a file, a command's output, or standard input. An LLM checks your
-condition. When the condition is true, Watcher emits a finding, sends a
-notification, or runs a verified action.
+1. Read text from a file, command, or standard input.
+2. Check for something you described in plain English.
+3. Print a result, show an alert, or run a command when it happens.
 
-That one idea covers many jobs. The stream can be logs, prices, a sensor feed,
-an inbox, or any text. The condition is a sentence, not a regex. So the same
-tool can watch a deploy, flag a bad number, or wait for one specific event —
-without new code each time.
+Use it to watch logs, wait for a build, check prices, follow a sensor, or monitor
+an inbox. The text and the condition change. Watcher stays the same.
 
 ## Install
 
@@ -48,9 +45,5 @@ watcher service install
 watcher status
 ```
 
-The daemon keeps offsets, context, findings, and budgets under `~/.watcher/`.
-It follows registry changes automatically and survives restarts.
-
-Watcher supports OpenAI-compatible models, JSON findings, desktop
-notifications, escalation, and independently verified command actions.
-
+Watcher saves its place and starts again after a restart. Edit
+`~/.watcher/watches.yaml` to add or change watches.
