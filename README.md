@@ -17,6 +17,10 @@ Watcher does three things:
 Use it to watch logs, wait for a build, check prices, follow a sensor, or monitor
 an inbox. The text and the condition change. Watcher stays the same.
 
+Agents can use Watcher to watch things cheaply instead of checking again and
+again. Watcher can also monitor agent runs, error streams, logs, and public
+feeds.
+
 ## Install
 
 ```sh
