@@ -1,0 +1,61 @@
+log_dir: runs
+
+profiles:
+  relaxed:
+    model: gpt-5.6-luna
+    api: responses
+    reasoning_effort: medium
+    service_tier: flex
+    price_input_per_mtok: 0.10
+    price_cached_input_per_mtok: 0.01
+    price_output_per_mtok: 0.60
+  fast:
+    model: gpt-5.6-luna
+    api: responses
+    reasoning_effort: low
+    price_input_per_mtok: 0.20
+    price_cached_input_per_mtok: 0.02
+    price_output_per_mtok: 1.20
+  smart:
+    model: gpt-5.6-terra
+    api: responses
+    reasoning_effort: medium
+    price_input_per_mtok: 2.00
+    price_cached_input_per_mtok: 0.20
+    price_output_per_mtok: 12.00
+  # local:
+  #   model: qwen2.5-7b-instruct
+  #   api: chat
+  #   base_url: http://127.0.0.1:8080/v1
+  #   api_key_env: LLAMA_API_KEY
+
+criteria:
+  - id: error-event
+    description: >
+      A line reports an error, failure, crash, or exception that a developer
+      would want to know about. Routine warnings, retries that succeed, and
+      successful requests do not count.
+
+actions:
+  - name: record
+    description: Record a finding so the user can review it later. Use for any matched criterion.
+    kind: log
+  - name: notify
+    description: Show a desktop notification. Use only for findings that need attention now.
+    kind: notify
+  - name: escalate
+    description: >
+      Hand the situation to a smarter model. Use when a criterion may be met but
+      the situation is ambiguous, severe, or hard to judge from the stream alone.
+    kind: escalate
+    profile: smart
+
+watches:
+  - name: demo-log
+    enabled: true
+    source: {type: file, path: runs/demo.log}
+    cadence: {preset: interval, every_seconds: 10, min_gap_seconds: 5}
+    profile: relaxed
+    criteria: [error-event]
+    actions: [record, notify]
+    window_max_chars: 32768
