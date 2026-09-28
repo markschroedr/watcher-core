@@ -28,8 +28,12 @@ from watcher.judge import Judge, StreamTurn
 DEFAULT_REGISTRY = Path.home() / ".watcher" / "watches.yaml"
 
 # (input, cached input, output) USD per 1M tokens. Flex rates equal batch rates
-# per the OpenAI pricing page; standard rates verified 2026-08-09.
+# per the OpenAI pricing page; standard rates verified 2026-09-28.
 _KNOWN_PRICES: dict[tuple[str, str | None], tuple[float, float, float]] = {
+    ("gpt-6-luna", None): (0.10, 0.01, 0.50),
+    ("gpt-6-luna", "flex"): (0.05, 0.005, 0.25),
+    ("gpt-6-sol", None): (2.00, 0.20, 10.00),
+    ("gpt-6-sol", "flex"): (1.00, 0.10, 5.00),
     ("gpt-5.6-luna", None): (0.20, 0.02, 1.20),
     ("gpt-5.6-luna", "flex"): (0.10, 0.01, 0.60),
     ("gpt-5.6-terra", None): (2.00, 0.20, 12.00),
@@ -46,27 +50,27 @@ log_dir: .
 
 profiles:
   relaxed:
-    model: gpt-5.6-luna
+    model: gpt-6-luna
     api: responses
     reasoning_effort: medium
     service_tier: flex
-    price_input_per_mtok: 0.10
-    price_cached_input_per_mtok: 0.01
-    price_output_per_mtok: 0.60
+    price_input_per_mtok: 0.05
+    price_cached_input_per_mtok: 0.005
+    price_output_per_mtok: 0.25
   fast:
-    model: gpt-5.6-luna
+    model: gpt-6-luna
     api: responses
     reasoning_effort: low
-    price_input_per_mtok: 0.20
-    price_cached_input_per_mtok: 0.02
-    price_output_per_mtok: 1.20
+    price_input_per_mtok: 0.10
+    price_cached_input_per_mtok: 0.01
+    price_output_per_mtok: 0.50
   smart:
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     api: responses
     reasoning_effort: medium
     price_input_per_mtok: 2.00
     price_cached_input_per_mtok: 0.20
-    price_output_per_mtok: 12.00
+    price_output_per_mtok: 10.00
 
 criteria: []
 
@@ -242,12 +246,12 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     }
     if mode["escalate"]:
         profiles["smart"] = ModelProfile(
-            model="gpt-5.6-terra",
+            model="gpt-6-sol",
             api="responses",
             reasoning_effort="medium",
             price_input_per_mtok=2.00,
             price_cached_input_per_mtok=0.20,
-            price_output_per_mtok=12.00,
+            price_output_per_mtok=10.00,
         )
         actions.append(
             ActionSpec(
@@ -432,7 +436,7 @@ def main() -> int:
     watch.add_argument("--notify", action="store_true", help="also expose a desktop-notification action")
     watch.add_argument("--from-start", action="store_true",
                        help="file source: include existing content (at most the last screening window)")
-    watch.add_argument("--model", default="gpt-5.6-luna")
+    watch.add_argument("--model", default="gpt-6-luna")
     watch.add_argument("--effort", choices=["minimal", "low", "medium", "high", "none"],
                        help="reasoning effort (default: mode)")
     watch.add_argument("--log-dir", type=Path, help="default: ~/.watcher/<name>")
