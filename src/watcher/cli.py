@@ -34,6 +34,8 @@ _KNOWN_PRICES: dict[tuple[str, str | None], tuple[float, float, float]] = {
     ("gpt-6-luna", "flex"): (0.05, 0.005, 0.25),
     ("gpt-6-sol", None): (2.00, 0.20, 10.00),
     ("gpt-6-sol", "flex"): (1.00, 0.10, 5.00),
+    ("gpt-6.1-sol", None): (2.00, 0.10, 10.00),
+    ("gpt-6.1-sol", "flex"): (1.00, 0.05, 5.00),
     ("gpt-5.6-luna", None): (0.20, 0.02, 1.20),
     ("gpt-5.6-luna", "flex"): (0.10, 0.01, 0.60),
     ("gpt-5.6-terra", None): (2.00, 0.20, 12.00),
@@ -65,11 +67,11 @@ profiles:
     price_cached_input_per_mtok: 0.01
     price_output_per_mtok: 0.50
   smart:
-    model: gpt-6-sol
+    model: gpt-6.1-sol
     api: responses
     reasoning_effort: medium
     price_input_per_mtok: 2.00
-    price_cached_input_per_mtok: 0.20
+    price_cached_input_per_mtok: 0.10
     price_output_per_mtok: 10.00
 
 criteria: []
@@ -246,11 +248,11 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     }
     if mode["escalate"]:
         profiles["smart"] = ModelProfile(
-            model="gpt-6-sol",
+            model="gpt-6.1-sol",
             api="responses",
             reasoning_effort="medium",
             price_input_per_mtok=2.00,
-            price_cached_input_per_mtok=0.20,
+            price_cached_input_per_mtok=0.10,
             price_output_per_mtok=10.00,
         )
         actions.append(
