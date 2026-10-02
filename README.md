@@ -62,5 +62,5 @@ Set `repeat_every_seconds` on a `notify` action to repeat an alert until you
 acknowledge it. Use `watcher alerts` to inspect alerts and `watcher ack <id>`
 to stop reminders. Repetition does not call the model again.
 
-Applications such as Daimon own their automation definitions and downstream
-actions. They use this same engine, not a separate integrated Watcher edition.
+Applications own their automation definitions and downstream actions.
+They use this same engine, not a separate integrated Watcher edition.
