@@ -9,7 +9,11 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+import yaml
+
+from watcher.presets import LUNA_MODEL, LUNA_PRICES, PRESETS
 from watcher.config import (
     ActionSpec,
     Cadence,
@@ -23,29 +27,11 @@ from watcher.config import (
     registry_signature,
 )
 from watcher import service
-from watcher.engine import Engine
-from watcher.estimate import estimate
-from watcher.judge import Judge, StreamTurn
-from watcher.notifications import Alerts, remove_notification
+
+if TYPE_CHECKING:
+    from watcher.notifications import Alerts
 
 DEFAULT_REGISTRY = Path.home() / ".watcher" / "watches.yaml"
-
-# (input, cached input, output) USD per 1M tokens. Flex rates equal batch rates
-# per the OpenAI pricing page; standard rates verified 2026-09-28.
-_KNOWN_PRICES: dict[tuple[str, str | None], tuple[float, float, float]] = {
-    ("gpt-6-luna", None): (0.10, 0.01, 0.50),
-    ("gpt-6-luna", "flex"): (0.05, 0.005, 0.25),
-    ("gpt-6-sol", None): (2.00, 0.20, 10.00),
-    ("gpt-6-sol", "flex"): (1.00, 0.10, 5.00),
-    ("gpt-6.1-sol", None): (2.00, 0.10, 10.00),
-    ("gpt-6.1-sol", "flex"): (1.00, 0.05, 5.00),
-    ("gpt-5.6-luna", None): (0.20, 0.02, 1.20),
-    ("gpt-5.6-luna", "flex"): (0.10, 0.01, 0.60),
-    ("gpt-5.6-terra", None): (2.00, 0.20, 12.00),
-    ("gpt-5.6-terra", "flex"): (1.00, 0.10, 6.00),
-    ("gpt-5.6-sol", None): (5.00, 0.50, 30.00),
-    ("gpt-5.6-sol", "flex"): (2.50, 0.25, 15.00),
-}
 
 _REGISTRY_TEMPLATE = """\
 # watcher registry — watches defined here run under the watcher daemon.
@@ -53,31 +39,10 @@ _REGISTRY_TEMPLATE = """\
 
 log_dir: .
 
-profiles:
-  relaxed:
-    model: gpt-6-luna
-    api: responses
-    reasoning_effort: medium
-    service_tier: flex
-    price_input_per_mtok: 0.05
-    price_cached_input_per_mtok: 0.005
-    price_output_per_mtok: 0.25
-  fast:
-    model: gpt-6-luna
-    api: responses
-    reasoning_effort: low
-    price_input_per_mtok: 0.10
-    price_cached_input_per_mtok: 0.01
-    price_output_per_mtok: 0.50
-  smart:
-    model: gpt-6.1-sol
-    api: responses
-    reasoning_effort: medium
-    service_tier: flex
-    price_input_per_mtok: 1.00
-    price_cached_input_per_mtok: 0.05
-    price_output_per_mtok: 5.00
-
+""" + yaml.safe_dump(
+    {"profiles": {name: preset["profile"] for name, preset in PRESETS.items()}},
+    sort_keys=False,
+) + """
 criteria: []
 
 actions:
@@ -100,8 +65,8 @@ watches: []
 #   - name: my-log
 #     enabled: true
 #     source: {type: file, path: /path/to/some.log}
-#     cadence: {preset: interval, every_seconds: 60}
-#     profile: relaxed
+#     cadence: {preset: interval, every_seconds: 300}
+#     profile: eco
 #     criteria: [error-event]
 #     actions: [record, notify]
 #     max_cost_usd: 1.00
@@ -130,51 +95,23 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    from watcher.engine import Engine
+
     asyncio.run(Engine(load(args.config), args.config).run())
     return 0
 
 
-# Pareto-placed presets for ad-hoc watches: each mode is a deliberate point on
-# the cost / latency / judgment-quality front. Explicit flags override.
-_MODES: dict[str, dict] = {
-    "fast": {
-        "cadence": ("realtime", 1.0),
-        "min_gap": 2.0,
-        "service_tier": None,
-        "effort": "low",
-        "window": 32768,
-        "escalate": False,
-    },
-    "balanced": {
-        "cadence": ("realtime", 2.0),
-        "min_gap": 5.0,
-        "service_tier": "flex",
-        "effort": "medium",
-        "window": 65536,
-        "escalate": False,
-    },
-    "eco": {
-        "cadence": ("interval", 60.0),
-        "min_gap": 30.0,
-        "service_tier": "flex",
-        "effort": "medium",
-        "window": 65536,
-        "escalate": False,
-    },
-    "thorough": {
-        "cadence": ("interval", 30.0),
-        "min_gap": 15.0,
-        "service_tier": "flex",
-        "effort": "high",
-        "window": 131072,
-        "escalate": True,
-    },
-}
+def _cmd_presets(args: argparse.Namespace) -> int:
+    """Applications consume these definitions instead of duplicating presets."""
+    print(json.dumps(PRESETS, indent=2))
+    return 0
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:
     """Ad-hoc watch from flags — no YAML file, findings as JSON lines on stdout."""
-    mode = _MODES[args.mode]
+    from watcher.engine import Engine
+
+    mode = PRESETS[args.mode]
     # Unique default name: parallel unnamed watches must not share a log dir
     # or a prompt-cache key.
     name = args.name if args.name is not None else f"adhoc-{os.getpid()}"
@@ -193,23 +130,18 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         else:
             criteria.append(Criterion(id=f"c{i}", description=description))
 
-    min_gap = args.min_gap if args.min_gap is not None else mode["min_gap"]
+    min_gap = args.min_gap if args.min_gap is not None else 0
     if args.every is not None:
         cadence = Cadence(preset="interval", every_seconds=args.every, min_gap_seconds=min_gap)
     elif args.manual:
         cadence = Cadence(preset="manual")
+    elif args.debounce is not None:
+        cadence = Cadence(
+            preset="realtime", debounce_seconds=args.debounce,
+            max_wait_seconds=args.max_wait, min_gap_seconds=min_gap,
+        )
     else:
-        preset, pace = mode["cadence"]
-        if preset == "interval":
-            cadence = Cadence(preset="interval", every_seconds=pace, min_gap_seconds=min_gap)
-        else:
-            debounce = args.debounce if args.debounce is not None else pace
-            cadence = Cadence(
-                preset="realtime",
-                debounce_seconds=debounce,
-                max_wait_seconds=args.max_wait,
-                min_gap_seconds=min_gap,
-            )
+        cadence = Cadence(**mode["cadence"], min_gap_seconds=min_gap)
 
     # One semantic reporting tool: print emits stdout JSON AND records durably,
     # so the model never has to choose between competing sinks.
@@ -230,12 +162,12 @@ def _cmd_watch(args: argparse.Namespace) -> int:
             )
         )
 
-    tier = mode["service_tier"]
+    tier = mode["profile"]["service_tier"]
     if args.price_in is not None and args.price_out is not None:
         cached = args.price_cached if args.price_cached is not None else args.price_in / 10
         prices = (args.price_in, cached, args.price_out)
     else:
-        prices = _KNOWN_PRICES.get((args.model, tier))
+        prices = LUNA_PRICES.get(tier) if args.model == LUNA_MODEL else None
         if prices is None:
             raise ConfigError(
                 f"no known prices for model {args.model!r} at tier {tier or 'standard'}; "
@@ -245,35 +177,13 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         "adhoc": ModelProfile(
             model=args.model,
             api="responses",
-            reasoning_effort=args.effort if args.effort is not None else mode["effort"],
+            reasoning_effort=args.effort if args.effort is not None else mode["profile"]["reasoning_effort"],
             service_tier=tier,
             price_input_per_mtok=prices[0],
             price_cached_input_per_mtok=prices[1],
             price_output_per_mtok=prices[2],
         )
     }
-    if mode["escalate"]:
-        profiles["smart"] = ModelProfile(
-            model="gpt-6.1-sol",
-            api="responses",
-            reasoning_effort="medium",
-            service_tier="flex",
-            price_input_per_mtok=1.00,
-            price_cached_input_per_mtok=0.05,
-            price_output_per_mtok=5.00,
-        )
-        actions.append(
-            ActionSpec(
-                name="escalate",
-                description=(
-                    "Hand the situation to a smarter model. Use when a criterion may be met "
-                    "but the situation is ambiguous, severe, or hard to judge from the stream alone."
-                ),
-                kind="escalate",
-                profile="smart",
-            )
-        )
-
     config = Config(
         profiles=profiles,
         criteria=criteria,
@@ -286,7 +196,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
                 profile="adhoc",
                 criteria=[c.id for c in criteria],
                 actions=[a.name for a in actions],
-                window_max_chars=args.window if args.window is not None else mode["window"],
+                window_max_chars=args.window if args.window is not None else mode["window_max_chars"],
                 oneshot=args.oneshot,
                 max_cost_usd=args.max_cost,
             )
@@ -298,6 +208,8 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_eval(args: argparse.Namespace) -> int:
+    from watcher.judge import Judge, StreamTurn
+
     config = load(args.config)
     watch = next((w for w in config.watches if w.name == args.watch), None)
     if watch is None:
@@ -313,6 +225,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 
 
 def _cmd_estimate(args: argparse.Namespace) -> int:
+    from watcher.estimate import estimate
+
     config = load(args.config)
     watch = next((w for w in config.watches if w.name == args.watch), None)
     if watch is None:
@@ -334,6 +248,8 @@ def _cmd_estimate(args: argparse.Namespace) -> int:
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
+    from watcher.engine import Engine
+
     _ensure_registry(args.registry)
     asyncio.run(Engine(load(args.registry), args.registry, daemon=True, persist=True).run())
     return 0
@@ -368,6 +284,8 @@ def _cmd_disable(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
+    from watcher.notifications import Alerts
+
     print(f"service: {service.status()}")
     if not args.registry.exists():
         print(f"registry: none ({args.registry})")
@@ -418,6 +336,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def _alert_store(args: argparse.Namespace) -> Alerts:
+    from watcher.notifications import Alerts
+
     return Alerts(args.log_dir if args.log_dir is not None else load(args.registry).log_dir)
 
 
@@ -437,6 +357,8 @@ def _cmd_alerts(args: argparse.Namespace) -> int:
 
 
 def _cmd_ack(args: argparse.Namespace) -> int:
+    from watcher.notifications import remove_notification
+
     acknowledged = _alert_store(args).acknowledge(alert_id=args.id, watch=args.watch)
     for identity in acknowledged:
         try:
@@ -480,6 +402,9 @@ def main() -> int:
     evaluate.add_argument("--input", type=Path, help="file with window content; default stdin")
     evaluate.set_defaults(func=_cmd_eval)
 
+    presets = sub.add_parser("presets", help="print the canonical preset definitions as JSON")
+    presets.set_defaults(func=_cmd_presets)
+
     watch = sub.add_parser("watch", help="ad-hoc watch from flags: findings as JSON lines on stdout")
     src = watch.add_mutually_exclusive_group(required=True)
     src.add_argument("--file", type=Path, help="tail this file")
@@ -488,15 +413,15 @@ def main() -> int:
     watch.add_argument("--criterion", action="append", required=True,
                        help="natural-language condition; repeatable; 'id=text' to name it")
     watch.add_argument("--name", help="watch name (default: adhoc-<pid>)")
-    watch.add_argument("--mode", default="eco", choices=sorted(_MODES),
-                       help="preset tradeoff: fast (standard tier, react asap), balanced (realtime, flex), "
-                            "eco (default, 60s, flex), thorough (flex, high effort + escalation)")
+    watch.add_argument("--mode", default="eco", choices=sorted(PRESETS),
+                       help="all Luna: eco (default, 5min, medium, Flex), "
+                            "fast (5s, low, Fast tier), thorough (5min, high, Flex)")
     watch.add_argument("--every", type=float, help="interval cadence in seconds (overrides the mode's cadence)")
     watch.add_argument("--manual", action="store_true", help="manual cadence: evaluate on SIGUSR1 only")
-    watch.add_argument("--debounce", type=float, help="realtime: quiet seconds before judging (default: mode)")
+    watch.add_argument("--debounce", type=float, help="use realtime cadence with this many quiet seconds before judging")
     watch.add_argument("--max-wait", type=float, default=30.0,
                        help="realtime: force an evaluation this long after the last one even without quiet (default 30)")
-    watch.add_argument("--min-gap", type=float, help="cost governor: minimum seconds between evaluations (default: mode)")
+    watch.add_argument("--min-gap", type=float, help="cost governor: minimum seconds between evaluations (default: 0)")
     watch.add_argument("--window", type=int, help="screening window in chars (default: mode)")
     watch.add_argument("--oneshot", action="store_true", help="stop after the first firing evaluation")
     watch.add_argument("--max-cost", type=float, default=0.50,
@@ -510,7 +435,7 @@ def main() -> int:
                        help="enable notifications that repeat until acknowledged; implies --notify")
     watch.add_argument("--from-start", action="store_true",
                        help="file source: include existing content (at most the last screening window)")
-    watch.add_argument("--model", default="gpt-6-luna")
+    watch.add_argument("--model", default=LUNA_MODEL)
     watch.add_argument("--effort", choices=["minimal", "low", "medium", "high", "none"],
                        help="reasoning effort (default: mode)")
     watch.add_argument("--log-dir", type=Path, help="default: ~/.watcher/<name>")

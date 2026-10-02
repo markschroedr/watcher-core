@@ -40,6 +40,23 @@ watcher watch \
 Use `--file`, `--cmd`, or `--stdin`. Add `--oneshot` when the first finding
 should end the watch.
 
+## Presets
+
+All built-in presets use GPT-6 Luna. None escalates to another model.
+
+| Mode | Use case | Batch interval | Effort | Inference tier |
+| --- | --- | --- | --- | --- |
+| `eco` (default) | Background monitoring | 5 minutes | Medium | Flex |
+| `fast` | Time-sensitive alerts | 5 seconds | Low | Fast (`priority`) |
+| `thorough` | Difficult conditions | 5 minutes | High | Flex |
+
+The interval controls when Watcher submits new data. Model latency comes after it.
+No new data means no judgment call. A busy stream does not extend the interval.
+Use `--every` to change the interval without changing the model or tier.
+
+`watcher presets` prints the canonical definitions as JSON. Application integrations
+read these definitions instead of maintaining their own presets.
+
 ## Keep it running
 
 ```sh
