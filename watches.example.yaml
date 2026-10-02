@@ -20,9 +20,10 @@ profiles:
     model: gpt-6-sol
     api: responses
     reasoning_effort: medium
-    price_input_per_mtok: 2.00
-    price_cached_input_per_mtok: 0.20
-    price_output_per_mtok: 10.00
+    service_tier: flex
+    price_input_per_mtok: 1.00
+    price_cached_input_per_mtok: 0.10
+    price_output_per_mtok: 5.00
   # local:
   #   model: qwen2.5-7b-instruct
   #   api: chat

@@ -73,9 +73,10 @@ profiles:
     model: gpt-6.1-sol
     api: responses
     reasoning_effort: medium
-    price_input_per_mtok: 2.00
-    price_cached_input_per_mtok: 0.10
-    price_output_per_mtok: 10.00
+    service_tier: flex
+    price_input_per_mtok: 1.00
+    price_cached_input_per_mtok: 0.05
+    price_output_per_mtok: 5.00
 
 criteria: []
 
@@ -147,7 +148,7 @@ _MODES: dict[str, dict] = {
     "balanced": {
         "cadence": ("realtime", 2.0),
         "min_gap": 5.0,
-        "service_tier": None,
+        "service_tier": "flex",
         "effort": "medium",
         "window": 65536,
         "escalate": False,
@@ -256,9 +257,10 @@ def _cmd_watch(args: argparse.Namespace) -> int:
             model="gpt-6.1-sol",
             api="responses",
             reasoning_effort="medium",
-            price_input_per_mtok=2.00,
-            price_cached_input_per_mtok=0.10,
-            price_output_per_mtok=10.00,
+            service_tier="flex",
+            price_input_per_mtok=1.00,
+            price_cached_input_per_mtok=0.05,
+            price_output_per_mtok=5.00,
         )
         actions.append(
             ActionSpec(
@@ -486,9 +488,9 @@ def main() -> int:
     watch.add_argument("--criterion", action="append", required=True,
                        help="natural-language condition; repeatable; 'id=text' to name it")
     watch.add_argument("--name", help="watch name (default: adhoc-<pid>)")
-    watch.add_argument("--mode", default="balanced", choices=sorted(_MODES),
-                       help="preset tradeoff: fast (react asap), balanced (default), "
-                            "eco (cheap background), thorough (high effort + escalation)")
+    watch.add_argument("--mode", default="eco", choices=sorted(_MODES),
+                       help="preset tradeoff: fast (standard tier, react asap), balanced (realtime, flex), "
+                            "eco (default, 60s, flex), thorough (flex, high effort + escalation)")
     watch.add_argument("--every", type=float, help="interval cadence in seconds (overrides the mode's cadence)")
     watch.add_argument("--manual", action="store_true", help="manual cadence: evaluate on SIGUSR1 only")
     watch.add_argument("--debounce", type=float, help="realtime: quiet seconds before judging (default: mode)")
