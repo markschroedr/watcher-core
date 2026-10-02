@@ -19,4 +19,6 @@ async def stop_process_group(process: asyncio.subprocess.Process) -> None:
             os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    await process.wait()
+    # Reap the leader and close pipe transports, including output left unread
+    # when a source or action was cancelled.
+    await process.communicate()
