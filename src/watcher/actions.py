@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import signal
 import time
 import uuid
 from pathlib import Path
@@ -15,6 +14,7 @@ from pydantic import BaseModel
 from watcher.config import ActionSpec
 from watcher.judge import Finding
 from watcher.notifications import Alerts, notify
+from watcher.processes import stop_process_group
 
 _COMMAND_TIMEOUT_SECONDS = 60
 
@@ -126,18 +126,7 @@ async def execute(
         except TimeoutError:
             return ActionOutcome(action=spec.name, status="error", detail="command timed out")
         finally:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    async with asyncio.timeout(5):
-                        while True:
-                            await asyncio.sleep(0.05)
-                            os.killpg(process.pid, 0)
-                except TimeoutError:
-                    os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await process.wait()
+            await stop_process_group(process)
         if process.returncode != 0:
             return ActionOutcome(action=spec.name, status="error", detail=stderr.decode(errors="replace").strip() or f"command exited with status {process.returncode}")
         return ActionOutcome(action=spec.name, status="ok")

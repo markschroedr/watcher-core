@@ -295,8 +295,4 @@ def load(path: Path) -> Config:
     # "next to the config file".
     if not config.log_dir.is_absolute():
         config.log_dir = (path.parent / config.log_dir).resolve()
-    for watch in config.watches:
-        source_path = watch.source.path
-        if source_path is not None and not source_path.is_absolute():
-            watch.source.path = (path.parent / source_path).resolve()
     return config

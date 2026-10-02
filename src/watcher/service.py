@@ -9,35 +9,16 @@ from __future__ import annotations
 
 import os
 import platform
+import plistlib
 import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from xml.sax.saxutils import escape
 
 from watcher.config import ConfigError
 
 _LABEL = "dev.watcher.daemon"
-
-_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{shell}</string>
-        <string>-lc</string>
-        <string>{command}</string>
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>{log}</string>
-    <key>StandardErrorPath</key><string>{log}</string>
-</dict>
-</plist>
-"""
 
 _SYSTEMD_UNIT = """[Unit]
 Description=watcher daemon (semantic stream watching)
@@ -78,12 +59,14 @@ class _Launchd:
         command = f"exec {shlex.quote(_binary())} daemon --registry {shlex.quote(str(registry))}"
         if env_file is not None:
             command = f"set -a; . {shlex.quote(str(env_file))}; set +a; {command}"
-        self.plist.write_text(
-            _PLIST.format(
-                label=_LABEL, shell=escape(_login_shell()), command=escape(command), log=escape(str(log)),
-            ),
-            encoding="utf-8",
-        )
+        self.plist.write_bytes(plistlib.dumps({
+            "Label": _LABEL,
+            "ProgramArguments": [_login_shell(), "-lc", command],
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "StandardOutPath": str(log),
+            "StandardErrorPath": str(log),
+        }))
         _run(["launchctl", "bootout", self.domain, str(self.plist)], check=False)
         _run(["launchctl", "bootstrap", self.domain, str(self.plist)])
 

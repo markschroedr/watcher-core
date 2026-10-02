@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import codecs
 import os
-import signal
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 from watcher.config import SourceSpec
+from watcher.processes import stop_process_group
 
 _POLL_SECONDS = 0.2
 
@@ -113,53 +113,36 @@ async def _stream_command(argv: list[str]) -> AsyncIterator[str]:
         start_new_session=True,
     )
     assert process.stdout is not None
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     try:
-        while True:
-            chunk = await process.stdout.read(65536)
-            if not chunk:
-                tail = decoder.decode(b"", final=True)
-                if tail:
-                    yield tail
-                code = await process.wait()
-                if code:
-                    raise RuntimeError(f"source command exited with status {code}")
-                return
-            text = decoder.decode(chunk)
-            if text:
-                yield text
+        async for text in _read_stream(process.stdout):
+            yield text
+        code = await process.wait()
+        if code:
+            raise RuntimeError(f"source command exited with status {code}")
     finally:
-        # The session leader may already have exited while children still own
-        # the output pipe. Its PID remains the process-group ID.
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                async with asyncio.timeout(5):
-                    while True:
-                        await asyncio.sleep(0.05)
-                        os.killpg(process.pid, 0)
-            except TimeoutError:
-                os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        await process.wait()
+        await stop_process_group(process)
 
 
 async def _read_stdin() -> AsyncIterator[str]:
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
     transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     try:
-        while True:
-            chunk = await reader.read(65536)
-            text = decoder.decode(chunk, final=not chunk)
-            if text:
-                yield text
-            if not chunk:
-                return
+        async for text in _read_stream(reader):
+            yield text
     finally:
         transport.close()
+
+
+async def _read_stream(reader: asyncio.StreamReader) -> AsyncIterator[str]:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while True:
+        chunk = await reader.read(65536)
+        text = decoder.decode(chunk, final=not chunk)
+        if text:
+            yield text
+        if not chunk:
+            return
 
 
 def open_source(spec: SourceSpec, tail_chars: int, state: dict | None = None) -> AsyncIterator[str]:

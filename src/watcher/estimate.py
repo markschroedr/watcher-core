@@ -146,7 +146,6 @@ async def estimate(
     # between the two.
     warm_noop, warm_hit = rate(price_cached, baseline.output_tokens), rate(price_cached, sampled.output_tokens)
     cold_noop, cold_hit = rate(price_in, baseline.output_tokens), rate(price_in, sampled.output_tokens)
-    cost_per_hour = {"noop": warm_noop, "hit": warm_hit}
     chars_per_usd_noop = data_chars_per_hour / warm_noop if warm_noop else 0.0
 
     return Estimate(
@@ -165,10 +164,10 @@ async def estimate(
         evals_per_hour_is_ceiling=is_ceiling,
         data_chars_per_hour=data_chars_per_hour,
         data_tokens_per_hour=data_tokens_per_hour,
-        cost_per_hour_usd_noop=cost_per_hour["noop"],
-        cost_per_hour_usd_hit=cost_per_hour["hit"],
+        cost_per_hour_usd_noop=warm_noop,
+        cost_per_hour_usd_hit=warm_hit,
         hours=hours,
-        cost_usd_noop=cost_per_hour["noop"] * hours,
-        cost_usd_hit=cost_per_hour["hit"] * hours,
+        cost_usd_noop=warm_noop * hours,
+        cost_usd_hit=warm_hit * hours,
         chars_per_usd_noop=chars_per_usd_noop,
     )
