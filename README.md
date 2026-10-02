@@ -51,3 +51,16 @@ watcher status
 
 Watcher saves its place and starts again after a restart. Edit
 `~/.watcher/watches.yaml` to add or change watches.
+
+The daemon also loads `watches.d/*.yaml` and `watches.d/*.yml` beside that
+registry. Applications can own separate fragments without editing your watches.
+A `spool` action delivers findings as durable JSON files for an application to
+consume. File start cursors and watch generations preserve activation boundaries.
+The daemon publishes loaded generations in `status.json`.
+
+Set `repeat_every_seconds` on a `notify` action to repeat an alert until you
+acknowledge it. Use `watcher alerts` to inspect alerts and `watcher ack <id>`
+to stop reminders. Repetition does not call the model again.
+
+Applications such as Daimon own their automation definitions and downstream
+actions. They use this same engine, not a separate integrated Watcher edition.

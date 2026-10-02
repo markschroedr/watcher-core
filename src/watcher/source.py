@@ -15,7 +15,12 @@ _POLL_SECONDS = 0.2
 
 
 async def _tail_file(
-    path: Path, from_start: bool, tail_chars: int, state: dict | None
+    path: Path,
+    from_start: bool,
+    tail_chars: int,
+    state: dict | None,
+    start_inode: int | None,
+    start_position: int | None,
 ) -> AsyncIterator[str]:
     """Tail a file. `state` (if given) carries {inode, position} across restarts:
     a matching inode resumes at the stored position, so content written while
@@ -33,11 +38,18 @@ async def _tail_file(
                     continue
                 stat = os.fstat(handle.fileno())
                 inode = stat.st_ino
-                resumed = False
+                resume_positions: list[int] = []
                 if first_open and state is not None:
-                    if state.get("inode") == inode and 0 <= state.get("position", -1) <= stat.st_size:
-                        handle.seek(state["position"])
-                        resumed = True
+                    position = state.get("position")
+                    if state.get("inode") == inode and isinstance(position, int) and 0 <= position <= stat.st_size:
+                        resume_positions.append(position)
+                if first_open and start_inode == inode and start_position is not None and start_position <= stat.st_size:
+                    resume_positions.append(start_position)
+                resumed = bool(resume_positions)
+                if resumed:
+                    # The explicit cursor is a lower boundary. Persisted state
+                    # can continue later, but it must never move before it.
+                    handle.seek(max(resume_positions))
                 if first_open and not resumed:
                     if not from_start:
                         handle.seek(0, os.SEEK_END)
@@ -134,7 +146,14 @@ async def _read_stdin() -> AsyncIterator[str]:
 def open_source(spec: SourceSpec, tail_chars: int, state: dict | None = None) -> AsyncIterator[str]:
     if spec.type == "file":
         assert spec.path is not None
-        return _tail_file(spec.path, spec.from_start, tail_chars, state)
+        return _tail_file(
+            spec.path,
+            spec.from_start,
+            tail_chars,
+            state,
+            spec.start_inode,
+            spec.start_position,
+        )
     if spec.type == "command":
         assert spec.command is not None
         return _stream_command(spec.command)

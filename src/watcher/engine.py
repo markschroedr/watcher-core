@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -12,7 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from watcher import actions as action_exec
-from watcher.config import Config, WatchSpec, load
+from watcher.config import ActionSpec, Config, WatchSpec, load, registry_signature
 from watcher.judge import (
     TURNS_ADAPTER,
     Finding,
@@ -25,6 +26,7 @@ from watcher.judge import (
     turn_chars,
 )
 from watcher.source import open_source
+from watcher.notifications import Alerts
 
 _TICK_SECONDS = 0.1
 _RESTART_DELAY_SECONDS = 30.0
@@ -69,6 +71,15 @@ class WatchRunner:
         self._actions = [config.action(name) for name in watch.actions]
         self._state_path = state_path
         self._source_state: dict | None = None
+        # Keep the persisted pending_spool field for existing registry consumers;
+        # this delivery queue also carries repeating notifications now.
+        self._pending_spool: list[dict] = []
+        self._pending_cursor: dict | None = None
+        self._evaluation_inode: int | None = None
+        self._evaluation_position: int | None = None
+        self._evaluation_observed_at = 0.0
+        self._pending_retry_at = 0.0
+        self._preserve_source_cursor = True
         # Position/inode of the last durably judged data. Only this is persisted;
         # the live read position may be ahead of what has been judged.
         self._committed_position: int | None = None
@@ -90,19 +101,28 @@ class WatchRunner:
             self._quarantine_state("not a state mapping")
             return
         source = data.get("source", {})
-        if isinstance(source.get("inode"), int) and isinstance(source.get("position"), int):
+        same_definition = data.get("fingerprint") == self.fingerprint
+        self._preserve_source_cursor = data.get("source_identity") == self._source_identity()
+        if self._preserve_source_cursor and isinstance(source.get("inode"), int) and isinstance(source.get("position"), int):
             self._source_state.update(inode=source["inode"], position=source["position"])
             self._committed_inode = source["inode"]
             self._committed_position = source["position"]
-        spent = data.get("spent_usd", 0.0)
-        self._spent_usd = float(spent) if isinstance(spent, (int, float)) else 0.0
-        try:
-            self._turns = TURNS_ADAPTER.validate_python(data.get("turns", []))
-        except Exception as exc:
-            _log(f"watch {self.watch.name!r}: discarding unreadable conversation state: {exc}")
-            self._turns = []
+        if same_definition:
+            spent = data.get("spent_usd", 0.0)
+            self._spent_usd = float(spent) if isinstance(spent, (int, float)) else 0.0
+            try:
+                self._turns = TURNS_ADAPTER.validate_python(data.get("turns", []))
+            except Exception as exc:
+                _log(f"watch {self.watch.name!r}: discarding unreadable conversation state: {exc}")
+                self._turns = []
+        pending = data.get("pending_spool", [])
+        cursor = data.get("pending_cursor")
+        if isinstance(pending, list) and all(isinstance(item, dict) for item in pending):
+            self._pending_spool = pending
+        if isinstance(cursor, dict):
+            self._pending_cursor = cursor
         _log(f"watch {self.watch.name!r}: state restored (spent ${self._spent_usd:.4f}, "
-             f"{len(self._turns)} turns)")
+             f"{len(self._turns)} turns, {len(self._pending_spool)} pending deliveries)")
 
     def _quarantine_state(self, why: str) -> None:
         assert self._state_path is not None
@@ -123,24 +143,57 @@ class WatchRunner:
             # Nothing judged in this file yet: resume where reading began.
             source = {"inode": live["inode"], "position": live["start_position"]}
         data = {
+            "fingerprint": self.fingerprint,
+            "generation": self.watch.generation,
+            "source_identity": self._source_identity(),
             "source": source,
             "spent_usd": self._spent_usd,
             "turns": TURNS_ADAPTER.dump_python(self._turns),
+            "pending_spool": self._pending_spool,
+            "pending_cursor": self._pending_cursor,
         }
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self._state_path)
 
+    def _source_identity(self) -> dict:
+        source = self.watch.source
+        if source.type == "file":
+            return {"type": "file", "path": str(source.path)}
+        if source.type == "command":
+            return {"type": "command", "command": source.command}
+        return {"type": "stdin"}
+
     def request_manual(self) -> None:
         self._manual.set()
 
     async def run(self) -> None:
+        # Publish the effective generation as soon as this runner owns the watch.
+        # Status readers can then distinguish a projected definition from one
+        # that the daemon has actually loaded.
+        self._save_state()
+        while self._pending_spool:
+            if await self._replay_pending_spool():
+                if self.watch.oneshot:
+                    self.terminal_reason = "oneshot"
+                    _log(f"watch {self.watch.name!r}: pending oneshot delivery completed, stopping")
+                    return
+                break
+            await asyncio.sleep(_TICK_SECONDS)
         consume = asyncio.create_task(self._consume())
         _log(f"watch {self.watch.name!r} running ({self.watch.cadence.preset})")
         try:
             while True:
                 await asyncio.sleep(_TICK_SECONDS)
+                if self._pending_spool:
+                    delivered = await self._replay_pending_spool()
+                    if delivered and self.watch.oneshot:
+                        self.terminal_reason = "oneshot"
+                        _log(f"watch {self.watch.name!r}: pending oneshot delivery completed, stopping")
+                        return
+                    if not delivered:
+                        continue
                 fired = False
                 if self._manual.is_set():
                     self._manual.clear()
@@ -261,7 +314,15 @@ class WatchRunner:
     def _criterion_of(self, finding: Finding):
         return next((c for c in self._criteria if c.id == finding.criterion), None)
 
-    async def _execute_finding(self, finding: Finding, allowed: list, label: str) -> dict:
+    async def _execute_finding(
+        self,
+        finding: Finding,
+        allowed: list,
+        label: str,
+        *,
+        finding_id: str | None = None,
+        observed_at: float | None = None,
+    ) -> dict:
         """Confirm (for effectful actions), execute, and record one finding."""
         spec = next((a for a in allowed if a.name == finding.action), None)
         if spec is None:
@@ -293,10 +354,99 @@ class WatchRunner:
                      f"REJECTED by verifier ({verdict.reason})")
                 return {"action": spec.name, "status": "rejected", "detail": verdict.reason}
 
-        outcome = await action_exec.execute(spec, finding, self.watch.name, self._config.log_dir)
+        outcome = await action_exec.execute(
+            spec,
+            finding,
+            self.watch.name,
+            self._config.log_dir,
+            finding_id=finding_id,
+            observed_at=observed_at,
+        )
         self._turns.append(FindingTurn(finding=finding, outcome=outcome.status))
         _log(f"watch {self.watch.name!r}: {label}{finding.criterion} -> {finding.action} ({outcome.status})")
         return outcome.model_dump()
+
+    async def _replay_pending_spool(self) -> bool:
+        if time.monotonic() < self._pending_retry_at:
+            return False
+        while self._pending_spool:
+            item = self._pending_spool[0]
+            try:
+                spec = ActionSpec.model_validate(item["action"])
+                finding = Finding.model_validate(item["finding"])
+                if spec.repeat_every_seconds is not None:
+                    current = next((a for a in self._actions if a.name == spec.name), None)
+                    if current is None or current.repeat_every_seconds is None:
+                        self._pending_spool.pop(0)
+                        self._save_state()
+                        continue  # repetition was revoked while this delivery was pending
+                    spec = current
+                outcome = await action_exec.execute(
+                    spec,
+                    finding,
+                    self.watch.name,
+                    self._config.log_dir,
+                    finding_id=item["finding_id"],
+                    observed_at=item["observed_at"],
+                )
+            except Exception as exc:
+                _log(f"watch {self.watch.name!r}: pending delivery is invalid: {exc}")
+                self._pending_retry_at = time.monotonic() + 5.0
+                return False
+            if outcome.status != "ok":
+                _log(
+                    f"watch {self.watch.name!r}: pending delivery failed "
+                    f"({outcome.detail or outcome.status})"
+                )
+                self._pending_retry_at = time.monotonic() + 5.0
+                return False
+            self._turns.append(FindingTurn(finding=finding, outcome="ok"))
+            self._pending_spool.pop(0)
+            self._save_state()
+
+        self._commit_pending_cursor()
+        self._pending_retry_at = 0.0
+        self._save_state()
+        return True
+
+    def _commit_pending_cursor(self) -> None:
+        if not self._preserve_source_cursor:
+            self._pending_cursor = None
+            self._committed_inode = None
+            self._committed_position = None
+            if self._source_state is not None:
+                self._source_state.clear()
+            return
+        cursor = self._pending_cursor or {}
+        inode = cursor.get("inode")
+        position = cursor.get("position")
+        if isinstance(inode, int) and isinstance(position, int):
+            self._committed_inode = inode
+            self._committed_position = position
+            live = self._source_state
+            if live is not None and live.get("inode") != inode:
+                live.update(inode=inode, position=position, start_position=position)
+        self._pending_cursor = None
+
+    def _spool_item(self, finding: Finding, spec: ActionSpec, index: str) -> dict:
+        identity = json.dumps(
+            {
+                "watch": self.watch.name,
+                "generation": self.watch.generation,
+                "inode": self._evaluation_inode,
+                "position": self._evaluation_position,
+                "index": index,
+                "finding": finding.model_dump(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return {
+            "finding_id": hashlib.sha256(identity.encode()).hexdigest(),
+            "finding": finding.model_dump(),
+            "action": spec.model_dump(mode="json"),
+            "observed_at": self._evaluation_observed_at,
+        }
 
     async def _escalate(self, spec, trigger_finding) -> tuple[str, dict]:
         """Re-judge the current conversation with a stronger profile; run its findings."""
@@ -314,8 +464,30 @@ class WatchRunner:
         if result.reasoning_items:
             self._turns.append(RawItemsTurn(items=result.reasoning_items))
         outcomes = []
-        for finding in result.findings:
-            outcomes.append(await self._execute_finding(finding, actions, f"[escalated:{spec.profile}] "))
+        for index, finding in enumerate(result.findings):
+            action = next((candidate for candidate in actions if candidate.name == finding.action), None)
+            pending_item = None
+            if action is not None and (action.kind == "spool" or action.repeat_every_seconds is not None):
+                pending_item = self._spool_item(finding, action, f"escalated:{index}")
+                self._pending_spool.append(pending_item)
+                self._pending_cursor = {
+                    "inode": self._evaluation_inode,
+                    "position": self._evaluation_position,
+                }
+                self._save_state()
+            outcome = await self._execute_finding(
+                finding,
+                actions,
+                f"[escalated:{spec.profile}] ",
+                finding_id=pending_item["finding_id"] if pending_item else None,
+                observed_at=pending_item["observed_at"] if pending_item else None,
+            )
+            outcomes.append(outcome)
+            if pending_item is not None and outcome["status"] == "ok":
+                self._pending_spool.remove(pending_item)
+                if not self._pending_spool:
+                    self._commit_pending_cursor()
+                self._save_state()
         detail = f"{spec.profile}: {len(result.findings)} findings"
         record = {
             "action": spec.name,
@@ -400,6 +572,20 @@ class WatchRunner:
         if result.reasoning_items:
             self._turns.append(RawItemsTurn(items=result.reasoning_items))
 
+        self._evaluation_inode = chunk_inode
+        self._evaluation_position = chunk_position
+        self._evaluation_observed_at = time.time()
+        pending = []
+        for index, finding in enumerate(result.findings):
+            spec = next((a for a in self._actions if a.name == finding.action), None)
+            if spec is None or (spec.kind != "spool" and spec.repeat_every_seconds is None):
+                continue
+            pending.append(self._spool_item(finding, spec, str(index)))
+        if pending:
+            self._pending_spool = pending
+            self._pending_cursor = {"inode": chunk_inode, "position": chunk_position}
+            self._save_state()
+
         outcomes = []
         escalations = []
         fired = False  # a real finding, not a mere hand-off to the escalation judge
@@ -415,18 +601,34 @@ class WatchRunner:
                     fired = True
                 _log(f"watch {self.watch.name!r}: {finding.criterion} -> {spec.name} ({detail})")
                 continue
-            outcome = await self._execute_finding(finding, self._actions, "")
+            pending_item = next(
+                (item for item in self._pending_spool if item["finding"] == finding.model_dump()),
+                None,
+            )
+            outcome = await self._execute_finding(
+                finding,
+                self._actions,
+                "",
+                finding_id=pending_item["finding_id"] if pending_item else None,
+                observed_at=pending_item["observed_at"] if pending_item else None,
+            )
             outcomes.append(outcome)
             if outcome["status"] == "ok":
                 fired = True
+                if pending_item is not None:
+                    self._pending_spool.remove(pending_item)
+                    if not self._pending_spool:
+                        self._commit_pending_cursor()
+                    self._save_state()
 
         if not result.findings:
             self._turns.append(TextTurn(content=result.text or "noop"))
 
         # Only now is the chunk durably judged: advance the committed cursor.
-        if chunk_inode is not None:
+        if chunk_inode is not None and not self._pending_spool:
             self._committed_inode = chunk_inode
             self._committed_position = chunk_position
+            self._pending_cursor = None
 
         cost = self._profile.cost_usd(result.input_tokens, result.cached_tokens, result.output_tokens)
         self._spent_usd += cost
@@ -446,7 +648,7 @@ class WatchRunner:
             record["escalations"] = escalations
         self._write_decision(record)
         self._save_state()
-        return fired
+        return fired and not self._pending_spool
 
     def _write_decision(self, record: dict) -> None:
         log_dir = self._config.log_dir
@@ -467,21 +669,19 @@ class Engine:
         self._config = config
         self._daemon = daemon
         self._persist = persist
-        self._config_mtime = self._current_mtime()
+        self._config_signature = self._current_signature()
         self._runners: dict[str, WatchRunner] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._judges: dict[str, Judge] = {}
         self._retry_at: dict[str, float] = {}
         self._reload_requested = False
         self._shutdown = asyncio.Event()
+        self._alerts = Alerts(config.log_dir)
 
-    def _current_mtime(self) -> float | None:
+    def _current_signature(self) -> tuple[tuple[str, int, int], ...]:
         if self._config_path is None:
-            return None
-        try:
-            return self._config_path.stat().st_mtime
-        except OSError:
-            return None
+            return ()
+        return registry_signature(self._config_path)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -491,16 +691,21 @@ class Engine:
             loop.add_signal_handler(sig, self._shutdown.set)
 
         await self._sync_runners()
+        self._write_status(alive=True)
         mode = "daemon" if self._daemon else "engine"
         _log(f"{mode} up, pid {os.getpid()} — SIGUSR1 = manual evaluate, SIGHUP = reload config")
         last_mtime_check = time.monotonic()
+        last_status_write = time.monotonic()
         while not self._shutdown.is_set():
             await asyncio.sleep(0.2)
+            if self._daemon and time.monotonic() - last_status_write >= 2.0:
+                last_status_write = time.monotonic()
+                self._write_status(alive=True)
             if self._daemon and time.monotonic() - last_mtime_check >= 2.0:
                 last_mtime_check = time.monotonic()
-                mtime = self._current_mtime()
-                if mtime != self._config_mtime:
-                    self._config_mtime = mtime
+                signature = self._current_signature()
+                if signature != self._config_signature:
+                    self._config_signature = signature
                     _log("registry changed on disk")
                     self._reload_requested = True
             if self._reload_requested:
@@ -527,13 +732,15 @@ class Engine:
                     elif now >= when and name not in self._tasks:
                         del self._retry_at[name]
                         self._start_runner(wanted[name])
-            if not self._tasks and not self._retry_at and not self._daemon:
+            await self._alerts.tick()
+            if not self._tasks and not self._retry_at and not self._daemon and not self._alerts.pending():
                 _log("all watches finished")
                 return
         _log("shutting down")
         for task in self._tasks.values():
             task.cancel()
         await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        self._write_status(alive=False)
 
     def _judge_for(self, profile_name: str) -> Judge:
         if profile_name not in self._judges:
@@ -552,13 +759,16 @@ class Engine:
         parts = [
             watch.model_dump_json(),
             *(self._config.criterion(cid).model_dump_json() for cid in watch.criteria),
-            *(a.model_dump_json() for a in actions),
+            *(a.model_dump_json(exclude={"repeat_every_seconds"} if a.repeat_every_seconds is None else set())
+              for a in actions),
             *(self._config.profiles[p].model_dump_json() for p in profile_names),
             str(self._config.log_dir),
         ]
         return "|".join(parts)
 
     async def _sync_runners(self) -> None:
+        self._alerts = Alerts(self._config.log_dir)
+        self._alerts.reconcile(self._config)
         wanted = {w.name: w for w in self._config.watches if w.enabled}
         for name in list(self._tasks):
             new_fingerprint = self._fingerprint(wanted[name]) if name in wanted else None
@@ -592,6 +802,29 @@ class Engine:
             return
         self._runners[watch.name] = runner
         self._tasks[watch.name] = asyncio.create_task(runner.run())
+
+    def _write_status(self, *, alive: bool) -> None:
+        if not self._daemon or self._config_path is None:
+            return
+        status_path = self._config_path.resolve().parent / "status.json"
+        watches = {
+            name: {
+                "generation": runner.watch.generation,
+                "state": "running" if name in self._tasks and not self._tasks[name].done() else "stopped",
+            }
+            for name, runner in self._runners.items()
+        }
+        for name in self._retry_at:
+            watches.setdefault(name, {"generation": None, "state": "retrying"})
+        payload = {
+            "alive": alive,
+            "pid": os.getpid(),
+            "updated_at": time.time(),
+            "watches": watches,
+        }
+        temporary = status_path.with_name(f".{status_path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        temporary.replace(status_path)
 
     def _manual_all(self) -> None:
         _log("manual evaluation requested")

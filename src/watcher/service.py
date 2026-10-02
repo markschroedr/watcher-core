@@ -28,7 +28,7 @@ _PLIST = """<?xml version="1.0" encoding="UTF-8"?>
     <array>
         <string>{shell}</string>
         <string>-lc</string>
-        <string>exec {binary} daemon --registry {registry}</string>
+        <string>{command}</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
@@ -43,6 +43,7 @@ Description=watcher daemon (semantic stream watching)
 
 [Service]
 ExecStart={shell} -lc 'exec {binary} daemon --registry {registry}'
+{environment_file}
 Restart=on-failure
 RestartSec=5
 
@@ -71,12 +72,14 @@ class _Launchd:
         self.plist = Path.home() / "Library" / "LaunchAgents" / f"{_LABEL}.plist"
         self.domain = f"gui/{os.getuid()}"
 
-    def install(self, log: Path, registry: Path) -> None:
+    def install(self, log: Path, registry: Path, env_file: Path | None) -> None:
         self.plist.parent.mkdir(parents=True, exist_ok=True)
+        command = f"exec {shlex.quote(_binary())} daemon --registry {shlex.quote(str(registry))}"
+        if env_file is not None:
+            command = f"set -a; . {shlex.quote(str(env_file))}; set +a; {command}"
         self.plist.write_text(
             _PLIST.format(
-                label=_LABEL, shell=_login_shell(), binary=_binary(),
-                registry=shlex.quote(str(registry)), log=log,
+                label=_LABEL, shell=_login_shell(), command=command, log=log,
             ),
             encoding="utf-8",
         )
@@ -103,12 +106,13 @@ class _Systemd:
     def __init__(self) -> None:
         self.unit = Path.home() / ".config" / "systemd" / "user" / "watcher.service"
 
-    def install(self, log: Path, registry: Path) -> None:
+    def install(self, log: Path, registry: Path, env_file: Path | None) -> None:
         del log  # journald owns daemon output on systemd
         self.unit.parent.mkdir(parents=True, exist_ok=True)
         self.unit.write_text(
             _SYSTEMD_UNIT.format(
-                shell=_login_shell(), binary=_binary(), registry=shlex.quote(str(registry))
+                shell=_login_shell(), binary=_binary(), registry=shlex.quote(str(registry)),
+                environment_file="" if env_file is None else f'EnvironmentFile="{_systemd_escape(str(env_file))}"',
             ),
             encoding="utf-8",
         )
@@ -138,10 +142,12 @@ def _backend() -> _Launchd | _Systemd:
     raise ConfigError(f"unsupported platform for service install: {system}")
 
 
-def install(log: Path, registry: Path) -> None:
+def install(log: Path, registry: Path, env_file: Path | None = None) -> None:
+    if env_file is not None and not env_file.is_file():
+        raise ConfigError(f"service environment file does not exist: {env_file}")
     backend = _backend()
     log.parent.mkdir(parents=True, exist_ok=True)
-    backend.install(log, registry)
+    backend.install(log, registry, env_file)
     kind = "launchd" if isinstance(backend, _Launchd) else "systemd"
     print(f"service installed and started ({kind})", file=sys.stderr)
 
@@ -153,3 +159,7 @@ def uninstall() -> None:
 
 def status() -> str:
     return _backend().status()
+
+
+def _systemd_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')

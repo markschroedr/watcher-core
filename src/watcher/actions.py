@@ -5,16 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import platform
-import shutil
 import signal
 import time
+import uuid
 from pathlib import Path
 
 from pydantic import BaseModel
 
 from watcher.config import ActionSpec
 from watcher.judge import Finding
+from watcher.notifications import Alerts, notify
 
 _COMMAND_TIMEOUT_SECONDS = 60
 
@@ -39,7 +39,15 @@ def _append_finding(finding: Finding, spec: ActionSpec, watch_name: str, log_dir
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-async def execute(spec: ActionSpec, finding: Finding, watch_name: str, log_dir: Path) -> ActionOutcome:
+async def execute(
+    spec: ActionSpec,
+    finding: Finding,
+    watch_name: str,
+    log_dir: Path,
+    *,
+    finding_id: str | None = None,
+    observed_at: float | None = None,
+) -> ActionOutcome:
     try:
         if spec.kind == "print":
             # One JSON line per finding on stdout — the event stream for
@@ -60,37 +68,45 @@ async def execute(spec: ActionSpec, finding: Finding, watch_name: str, log_dir: 
             return ActionOutcome(action=spec.name, status="ok")
 
         if spec.kind == "notify":
-            # terminal-notifier has its own app identity in Notification settings
-            # (banner-capable); osascript notifications hide under "Script Editor",
-            # which is often set to quiet delivery. On Linux, notify-send.
-            if platform.system() == "Darwin":
-                if shutil.which("terminal-notifier"):
-                    argv = [
-                        "terminal-notifier",
-                        "-title", f"watcher: {watch_name}",
-                        "-message", finding.summary,
-                        "-sound", "Glass",
-                    ]
-                else:
-                    script = (
-                        f'display notification {json.dumps(finding.summary)} '
-                        f'with title {json.dumps(f"watcher: {watch_name}")} sound name "Glass"'
-                    )
-                    argv = ["osascript", "-e", script]
-            elif shutil.which("notify-send"):
-                argv = ["notify-send", f"watcher: {watch_name}", finding.summary]
-            else:
-                return ActionOutcome(
-                    action=spec.name, status="error",
-                    detail="no notification backend (need terminal-notifier/osascript or notify-send)",
+            if spec.repeat_every_seconds is not None:
+                identity = Alerts(log_dir).enqueue(
+                    watch_name, spec.name, finding, spec.repeat_every_seconds,
+                    alert_id=finding_id,
                 )
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await process.communicate()
-            if process.returncode != 0:
-                return ActionOutcome(action=spec.name, status="error", detail=stderr.decode().strip())
+                return ActionOutcome(action=spec.name, status="ok", detail=f"queued alert {identity}")
+            await notify(finding.summary, watch_name)
+            return ActionOutcome(action=spec.name, status="ok")
+
+        if spec.kind == "spool":
+            assert spec.directory is not None
+            assert finding_id is not None
+            spec.directory.mkdir(parents=True, exist_ok=True)
+            destination = spec.directory / f"{finding_id}.json"
+            if destination.exists():
+                return ActionOutcome(action=spec.name, status="ok", detail="already delivered")
+            record = {
+                **spec.metadata,
+                "finding_id": finding_id,
+                "watch": watch_name,
+                "criterion": finding.criterion,
+                "summary": finding.summary,
+                "evidence": finding.evidence,
+                "observed_at": observed_at if observed_at is not None else time.time(),
+            }
+            temporary = spec.directory / f".{finding_id}.{uuid.uuid4().hex}.tmp"
+            try:
+                with temporary.open("x", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temporary.replace(destination)
+                directory_fd = os.open(spec.directory, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                temporary.unlink(missing_ok=True)
             return ActionOutcome(action=spec.name, status="ok")
 
         # kind == "command": fixed argv from config, finding as JSON on stdin.
@@ -123,5 +139,5 @@ async def execute(spec: ActionSpec, finding: Finding, watch_name: str, log_dir: 
         if process.returncode != 0:
             return ActionOutcome(action=spec.name, status="error", detail=stderr.decode().strip())
         return ActionOutcome(action=spec.name, status="ok")
-    except OSError as exc:
+    except (OSError, RuntimeError, TimeoutError) as exc:
         return ActionOutcome(action=spec.name, status="error", detail=str(exc))

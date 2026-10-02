@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -52,20 +52,32 @@ class ActionSpec(BaseModel):
     # Names become API function-tool names; the pattern is OpenAI's constraint.
     name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
     description: str
-    kind: Literal["log", "notify", "command", "escalate", "print"]
+    kind: Literal["log", "notify", "command", "escalate", "print", "spool"]
     command: list[str] | None = None
+    directory: Path | None = None
+    metadata: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
     profile: str | None = None  # escalate: re-judge the same conversation with this profile
     # command: an independent judge on this profile must confirm the finding
     # before the command runs. Reason: the trigger is model-controlled and the
     # stream is untrusted; a second skeptical judgment is the authorization gate.
     confirm_profile: str | None = None
+    # Notification delivery repeats without re-judging until a human acknowledges it.
+    repeat_every_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _fields_match_kind(self) -> "ActionSpec":
+        if self.repeat_every_seconds is not None and self.kind != "notify":
+            raise ValueError(f"action {self.name!r}: only kind 'notify' can repeat until acknowledged")
         if self.kind == "command" and not self.command:
             raise ValueError(f"action {self.name!r}: kind 'command' requires a command argv list")
         if self.kind != "command" and self.command:
             raise ValueError(f"action {self.name!r}: only kind 'command' takes a command")
+        if self.kind == "spool" and self.directory is None:
+            raise ValueError(f"action {self.name!r}: kind 'spool' requires a directory")
+        if self.kind != "spool" and self.directory is not None:
+            raise ValueError(f"action {self.name!r}: only kind 'spool' takes a directory")
+        if self.kind != "spool" and self.metadata:
+            raise ValueError(f"action {self.name!r}: only kind 'spool' takes metadata")
         if self.kind == "escalate" and not self.profile:
             raise ValueError(f"action {self.name!r}: kind 'escalate' requires a target profile")
         if self.kind != "escalate" and self.profile:
@@ -110,6 +122,8 @@ class SourceSpec(BaseModel):
     type: Literal["file", "stdin", "command"]
     path: Path | None = None
     from_start: bool = False
+    start_inode: int | None = Field(default=None, gt=0)
+    start_position: int | None = Field(default=None, ge=0)
     command: list[str] | None = None  # spawned; merged stdout+stderr is the stream
 
     @model_validator(mode="after")
@@ -118,6 +132,10 @@ class SourceSpec(BaseModel):
             raise ValueError("source type 'file' requires a path")
         if self.type != "file" and self.path is not None:
             raise ValueError("only source type 'file' takes a path")
+        if self.type != "file" and (self.start_inode is not None or self.start_position is not None):
+            raise ValueError("only source type 'file' takes a start cursor")
+        if (self.start_inode is None) != (self.start_position is None):
+            raise ValueError("a file start cursor requires both start_inode and start_position")
         if self.type == "command" and not self.command:
             raise ValueError("source type 'command' requires a command argv list")
         if self.type != "command" and self.command:
@@ -127,6 +145,7 @@ class SourceSpec(BaseModel):
 
 class WatchSpec(BaseModel):
     name: str
+    generation: int | None = Field(default=None, gt=0)
     enabled: bool = True
     source: SourceSpec
     cadence: Cadence
@@ -197,14 +216,75 @@ class Config(BaseModel):
         return next(a for a in self.actions if a.name == name)
 
 
-def load(path: Path) -> Config:
+def fragment_directory(path: Path) -> Path:
+    return path.parent / "watches.d"
+
+
+def registry_signature(path: Path) -> tuple[tuple[str, int, int], ...]:
+    paths = [path]
+    directory = fragment_directory(path)
+    if directory.is_dir():
+        paths.extend(sorted(directory.glob("*.yaml")))
+        paths.extend(sorted(directory.glob("*.yml")))
+    signature = []
+    for candidate in paths:
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        signature.append((str(candidate), stat.st_mtime_ns, stat.st_size))
+    return tuple(signature)
+
+
+def _read_mapping(path: Path) -> dict[str, Any]:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError(f"cannot read config {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"config {path} must be a YAML mapping")
-    config = Config.model_validate(data)
+    return data
+
+
+def _resolve_paths(data: dict[str, Any], path: Path, *, allow_log_dir: bool) -> None:
+    if "log_dir" in data and not allow_log_dir:
+        raise ConfigError(f"fragment {path} must not set log_dir")
+    for action in data.get("actions") or []:
+        directory = action.get("directory") if isinstance(action, dict) else None
+        if directory is not None and not Path(directory).is_absolute():
+            action["directory"] = str((path.parent / directory).resolve())
+    for watch in data.get("watches") or []:
+        source = watch.get("source") if isinstance(watch, dict) else None
+        source_path = source.get("path") if isinstance(source, dict) else None
+        if source_path is not None and not Path(source_path).is_absolute():
+            source["path"] = str((path.parent / source_path).resolve())
+
+
+def load(path: Path) -> Config:
+    data = _read_mapping(path)
+    _resolve_paths(data, path, allow_log_dir=True)
+    merged: dict[str, Any] = {
+        "profiles": dict(data.get("profiles") or {}),
+        "criteria": list(data.get("criteria") or []),
+        "actions": list(data.get("actions") or []),
+        "watches": list(data.get("watches") or []),
+        "log_dir": data.get("log_dir", "runs"),
+    }
+    directory = fragment_directory(path)
+    fragments = []
+    if directory.is_dir():
+        fragments = sorted({*directory.glob("*.yaml"), *directory.glob("*.yml")})
+    for fragment in fragments:
+        extra = _read_mapping(fragment)
+        _resolve_paths(extra, fragment, allow_log_dir=False)
+        for name, profile in (extra.get("profiles") or {}).items():
+            if name in merged["profiles"]:
+                raise ConfigError(f"fragment {fragment}: duplicate profile {name!r}")
+            merged["profiles"][name] = profile
+        for key in ("criteria", "actions", "watches"):
+            merged[key].extend(extra.get(key) or [])
+
+    config = Config.model_validate(merged)
     # A daemon may start with an arbitrary cwd; relative paths mean
     # "next to the config file".
     if not config.log_dir.is_absolute():

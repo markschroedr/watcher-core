@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from watcher.config import (
@@ -19,11 +20,13 @@ from watcher.config import (
     SourceSpec,
     WatchSpec,
     load,
+    registry_signature,
 )
 from watcher import service
 from watcher.engine import Engine
 from watcher.estimate import estimate
 from watcher.judge import Judge, StreamTurn
+from watcher.notifications import Alerts, remove_notification
 
 DEFAULT_REGISTRY = Path.home() / ".watcher" / "watches.yaml"
 
@@ -119,8 +122,9 @@ def _cmd_check(args: argparse.Namespace) -> int:
           f"{len(config.profiles)} profiles")
     for watch in config.watches:
         state = "on " if watch.enabled else "off"
+        generation = f" generation={watch.generation}" if watch.generation is not None else ""
         print(f"  [{state}] {watch.name}: {watch.source.type} -> {watch.cadence.preset} "
-          f"-> {watch.profile} -> {watch.actions}")
+          f"-> {watch.profile} -> {watch.actions}{generation}")
     return 0
 
 
@@ -215,12 +219,13 @@ def _cmd_watch(args: argparse.Namespace) -> int:
             kind="print",
         ),
     ]
-    if args.notify:
+    if args.notify or args.repeat_every is not None:
         actions.append(
             ActionSpec(
                 name="notify",
                 description="Show a desktop notification. Use only for findings that need attention now.",
                 kind="notify",
+                repeat_every_seconds=args.repeat_every,
             )
         )
 
@@ -338,14 +343,16 @@ def _set_enabled(registry: Path, name: str, value: bool) -> int:
     _ensure_registry(registry)
     yaml_rt = YAML()
     yaml_rt.preserve_quotes = True
-    data = yaml_rt.load(registry.read_text(encoding="utf-8"))
-    for watch in data.get("watches") or []:
-        if watch.get("name") == name:
-            watch["enabled"] = value
-            with registry.open("w", encoding="utf-8") as handle:
-                yaml_rt.dump(data, handle)
-            print(f"{name}: {'enabled' if value else 'disabled'} (daemon follows within ~2s)")
-            return 0
+    for candidate, _, _ in registry_signature(registry):
+        path = Path(candidate)
+        data = yaml_rt.load(path.read_text(encoding="utf-8"))
+        for watch in data.get("watches") or []:
+            if watch.get("name") == name:
+                watch["enabled"] = value
+                with path.open("w", encoding="utf-8") as handle:
+                    yaml_rt.dump(data, handle)
+                print(f"{name}: {'enabled' if value else 'disabled'} (daemon follows within ~2s)")
+                return 0
     print(f"unknown watch {name!r} in {registry}", file=sys.stderr)
     return 2
 
@@ -364,27 +371,88 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(f"registry: none ({args.registry})")
         return 0
     config = load(args.registry)
+    runtime_watches = {}
+    status_file = args.registry.resolve().parent / "status.json"
+    if status_file.exists():
+        try:
+            runtime = json.loads(status_file.read_text(encoding="utf-8"))
+            if runtime.get("alive") and time.time() - float(runtime.get("updated_at", 0)) <= 10:
+                runtime_watches = runtime.get("watches") or {}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            runtime_watches = {}
     print(f"registry: {args.registry} ({len(config.watches)} watches)")
     for watch in config.watches:
         state_file = config.log_dir / "state" / f"{watch.name}.json"
         spent = ""
+        loaded_generation = (runtime_watches.get(watch.name) or {}).get("generation")
         if state_file.exists():
             try:
-                spent_usd = json.loads(state_file.read_text(encoding="utf-8")).get("spent_usd", 0.0)
+                state = json.loads(state_file.read_text(encoding="utf-8"))
+                if loaded_generation is None:
+                    loaded_generation = state.get("generation")
+                spent_usd = state.get("spent_usd", 0.0)
                 spent = f", spent ${spent_usd:.4f}"
                 if watch.max_cost_usd is not None:
                     spent += f" of ${watch.max_cost_usd:.2f}"
+                pending = len(state.get("pending_spool") or [])
+                if pending:
+                    spent += f", {pending} pending deliveries"
             except (OSError, json.JSONDecodeError):
                 spent = ", state unreadable"
         flag = "on " if watch.enabled else "off"
-        print(f"  [{flag}] {watch.name}: {watch.source.type} -> {watch.cadence.preset}{spent}")
+        if watch.generation is None:
+            generation = ""
+        elif loaded_generation == watch.generation:
+            generation = f", generation {watch.generation} loaded"
+        elif loaded_generation is None:
+            generation = f", generation {watch.generation} pending"
+        else:
+            generation = f", generation {watch.generation} pending (loaded {loaded_generation})"
+        print(f"  [{flag}] {watch.name}: {watch.source.type} -> {watch.cadence.preset}{generation}{spent}")
+    pending = Alerts(config.log_dir).pending()
+    if pending:
+        print(f"{len(pending)} unacknowledged alerts — watcher alerts to inspect; watcher ack <id> to stop")
+    return 0
+
+
+def _alert_store(args: argparse.Namespace) -> Alerts:
+    return Alerts(args.log_dir if args.log_dir is not None else load(args.registry).log_dir)
+
+
+def _cmd_alerts(args: argparse.Namespace) -> int:
+    pending = _alert_store(args).pending()
+    if args.json:
+        print(json.dumps(pending, ensure_ascii=False, indent=2))
+    elif not pending:
+        print("No unacknowledged alerts.")
+    else:
+        for alert in pending:
+            print(f"{alert['id']}  {alert['watch']}  every {alert['repeat_seconds']:g}s\n"
+                  f"  {alert['summary']}\n  {alert['evidence']}")
+            if alert["last_error"]:
+                print(f"  delivery error: {alert['last_error']}")
+    return 0
+
+
+def _cmd_ack(args: argparse.Namespace) -> int:
+    acknowledged = _alert_store(args).acknowledge(alert_id=args.id, watch=args.watch)
+    for identity in acknowledged:
+        try:
+            asyncio.run(remove_notification(identity))
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            print(f"acknowledged {identity}, but could not dismiss desktop notification: {exc}", file=sys.stderr)
+    print(f"Acknowledged {len(acknowledged)} alert(s). Future reminders are stopped.")
     return 0
 
 
 def _cmd_service(args: argparse.Namespace) -> int:
     if args.action == "install":
         _ensure_registry(args.registry)
-        service.install(log=Path.home() / ".watcher" / "daemon.log", registry=args.registry.resolve())
+        service.install(
+            log=Path.home() / ".watcher" / "daemon.log",
+            registry=args.registry.resolve(),
+            env_file=None if args.env_file is None else args.env_file.resolve(),
+        )
     elif args.action == "uninstall":
         service.uninstall()
     else:
@@ -436,6 +504,8 @@ def main() -> int:
     watch.add_argument("--price-out", type=float, help="output USD per 1M tokens (required for unknown models)")
     watch.add_argument("--price-cached", type=float, help="cached-input USD per 1M tokens (default: --price-in / 10)")
     watch.add_argument("--notify", action="store_true", help="also expose a desktop-notification action")
+    watch.add_argument("--repeat-every", type=float, metavar="SECONDS",
+                       help="enable notifications that repeat until acknowledged; implies --notify")
     watch.add_argument("--from-start", action="store_true",
                        help="file source: include existing content (at most the last screening window)")
     watch.add_argument("--model", default="gpt-6-luna")
@@ -472,9 +542,24 @@ def main() -> int:
     status.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
     status.set_defaults(func=_cmd_status)
 
+    alerts = sub.add_parser("alerts", help="list unacknowledged repeating notifications")
+    alerts.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
+    alerts.add_argument("--log-dir", type=Path, help="ad-hoc watch's log directory (instead of registry)")
+    alerts.add_argument("--json", action="store_true", help="machine-readable pending alerts")
+    alerts.set_defaults(func=_cmd_alerts)
+
+    ack = sub.add_parser("ack", help="acknowledge notifications and stop their reminders")
+    target = ack.add_mutually_exclusive_group(required=True)
+    target.add_argument("id", nargs="?", help="alert ID from watcher alerts")
+    target.add_argument("--watch", help="acknowledge all currently pending alerts for this watch")
+    ack.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
+    ack.add_argument("--log-dir", type=Path, help="ad-hoc watch's log directory (instead of registry)")
+    ack.set_defaults(func=_cmd_ack)
+
     svc = sub.add_parser("service", help="install/uninstall the background daemon (launchd/systemd)")
     svc.add_argument("action", choices=["install", "uninstall", "status"])
     svc.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
+    svc.add_argument("--env-file", type=Path, help="trusted KEY=VALUE file loaded only by the installed daemon")
     svc.set_defaults(func=_cmd_service)
 
     args = parser.parse_args()
