@@ -108,6 +108,9 @@ class WatchRunner:
             self._committed_inode = source["inode"]
             self._committed_position = source["position"]
         if same_definition:
+            terminal = data.get("terminal_reason")
+            if terminal in ("oneshot", "budget"):
+                self.terminal_reason = terminal
             spent = data.get("spent_usd", 0.0)
             self._spent_usd = float(spent) if isinstance(spent, (int, float)) else 0.0
             try:
@@ -145,6 +148,7 @@ class WatchRunner:
         data = {
             "fingerprint": self.fingerprint,
             "generation": self.watch.generation,
+            "terminal_reason": self.terminal_reason,
             "source_identity": self._source_identity(),
             "source": source,
             "spent_usd": self._spent_usd,
@@ -173,14 +177,22 @@ class WatchRunner:
         # Status readers can then distinguish a projected definition from one
         # that the daemon has actually loaded.
         self._save_state()
+        if self.terminal_reason is not None and not self._pending_spool:
+            return
         while self._pending_spool:
             if await self._replay_pending_spool():
                 if self.watch.oneshot:
                     self.terminal_reason = "oneshot"
+                    self._save_state()
                     _log(f"watch {self.watch.name!r}: pending oneshot delivery completed, stopping")
                     return
                 break
             await asyncio.sleep(_TICK_SECONDS)
+        if self._budget_exhausted():
+            self.terminal_reason = "budget"
+            self._save_state()
+            return
+        self._preserve_source_cursor = True
         consume = asyncio.create_task(self._consume())
         _log(f"watch {self.watch.name!r} running ({self.watch.cadence.preset})")
         try:
@@ -194,12 +206,16 @@ class WatchRunner:
                         return
                     if not delivered:
                         continue
+                if self._budget_exhausted():
+                    self.terminal_reason = "budget"
+                    _log(f"watch {self.watch.name!r}: budget threshold reached (${self._spent_usd:.6f}), stopping")
+                    return
                 fired = False
                 if self._manual.is_set():
                     self._manual.clear()
                     fired = await self._evaluate("manual")
                 else:
-                    reason = self._due()
+                    reason = self._due(source_ended=consume.done())
                     if reason is not None:
                         fired = await self._evaluate(reason)
                     elif self._keepalive_due():
@@ -209,22 +225,25 @@ class WatchRunner:
                     _log(f"watch {self.watch.name!r}: oneshot fired, stopping")
                     return
                 budget = self.watch.max_cost_usd
-                if budget is not None and self._spent_usd >= budget:
+                if budget is not None and self._spent_usd >= budget and not self._pending_spool:
                     self.terminal_reason = "budget"
                     _log(
                         f"watch {self.watch.name!r}: budget threshold crossed "
                         f"(${self._spent_usd:.6f} of ${budget:.6f}), stopping"
                     )
                     return
-                if consume.done() and not self._buffer:
-                    if time.monotonic() < self._backoff_until:
-                        continue  # a failed final chunk may still be requeued
+                if consume.done() and not self._buffer and not self._pending_spool:
+                    consume.result()  # Surface source failures, including nonzero command exits.
                     _log(f"watch {self.watch.name!r}: stream ended")
                     return
         finally:
             consume.cancel()
             await asyncio.gather(consume, return_exceptions=True)
             self._save_state()
+
+    def _budget_exhausted(self) -> bool:
+        budget = self.watch.max_cost_usd
+        return budget is not None and self._spent_usd >= budget
 
     async def _consume(self) -> None:
         async for data in open_source(self.watch.source, self.watch.window_max_chars, self._source_state):
@@ -290,7 +309,7 @@ class WatchRunner:
         )
         self._save_state()
 
-    def _due(self) -> str | None:
+    def _due(self, *, source_ended: bool = False) -> str | None:
         cadence = self.watch.cadence
         now = time.monotonic()
         if now < self._backoff_until or now - self._last_eval_at < cadence.min_gap_seconds:
@@ -305,6 +324,8 @@ class WatchRunner:
             if now - self._last_eval_at >= cadence.max_wait_seconds:
                 return "max_wait"
         elif cadence.preset == "interval":
+            if source_ended and self._buffer and cadence.every_seconds is None:
+                return "eof"
             if cadence.every_bytes is not None and self._buffered_chars >= cadence.every_bytes:
                 return "volume"
             if cadence.every_seconds is not None and self._buffer and now - self._last_eval_at >= cadence.every_seconds:
@@ -337,6 +358,9 @@ class WatchRunner:
             # Model output is a proposal, not authorization: an independent
             # skeptical judge on the confirm profile gates effectful actions.
             assert spec.confirm_profile is not None
+            if self._budget_exhausted():
+                self._turns.append(FindingTurn(finding=finding, outcome="budget exhausted before confirmation"))
+                return {"action": spec.name, "status": "error", "detail": "budget exhausted before confirmation"}
             try:
                 verdict = await self._judge_for(spec.confirm_profile).confirm(
                     self.watch.name, criterion, finding, self._turns
@@ -400,8 +424,17 @@ class WatchRunner:
                 )
                 self._pending_retry_at = time.monotonic() + 5.0
                 return False
-            self._turns.append(FindingTurn(finding=finding, outcome="ok"))
+            for turn in reversed(self._turns):
+                if isinstance(turn, FindingTurn) and turn.finding == finding:
+                    turn.outcome = "ok"
+                    break
+            else:
+                self._turns.append(FindingTurn(finding=finding, outcome="ok"))
             self._pending_spool.pop(0)
+            if not self._pending_spool:
+                self._commit_pending_cursor()
+                if self.watch.oneshot:
+                    self.terminal_reason = "oneshot"
             self._save_state()
 
         self._commit_pending_cursor()
@@ -450,6 +483,8 @@ class WatchRunner:
 
     async def _escalate(self, spec, trigger_finding) -> tuple[str, dict]:
         """Re-judge the current conversation with a stronger profile; run its findings."""
+        if self._budget_exhausted():
+            return "budget exhausted", {"action": spec.name, "error": "budget exhausted"}
         judge = self._judge_for(spec.profile)
         actions = [a for a in self._actions if a.kind != "escalate"]
         try:
@@ -467,7 +502,7 @@ class WatchRunner:
         for index, finding in enumerate(result.findings):
             action = next((candidate for candidate in actions if candidate.name == finding.action), None)
             pending_item = None
-            if action is not None and (action.kind == "spool" or action.repeat_every_seconds is not None):
+            if self._criterion_of(finding) is not None and action is not None and (action.kind == "spool" or action.repeat_every_seconds is not None):
                 pending_item = self._spool_item(finding, action, f"escalated:{index}")
                 self._pending_spool.append(pending_item)
                 self._pending_cursor = {
@@ -568,6 +603,8 @@ class WatchRunner:
             self._write_decision(record)
             return False
         self._consecutive_errors = 0
+        cost = self._profile.cost_usd(result.input_tokens, result.cached_tokens, result.output_tokens)
+        self._spent_usd += cost
 
         if result.reasoning_items:
             self._turns.append(RawItemsTurn(items=result.reasoning_items))
@@ -578,7 +615,7 @@ class WatchRunner:
         pending = []
         for index, finding in enumerate(result.findings):
             spec = next((a for a in self._actions if a.name == finding.action), None)
-            if spec is None or (spec.kind != "spool" and spec.repeat_every_seconds is None):
+            if self._criterion_of(finding) is None or spec is None or (spec.kind != "spool" and spec.repeat_every_seconds is None):
                 continue
             pending.append(self._spool_item(finding, spec, str(index)))
         if pending:
@@ -591,13 +628,13 @@ class WatchRunner:
         fired = False  # a real finding, not a mere hand-off to the escalation judge
         for finding in result.findings:
             spec = next((a for a in self._actions if a.name == finding.action), None)
-            if spec is not None and spec.kind == "escalate":
+            if self._criterion_of(finding) is not None and spec is not None and spec.kind == "escalate":
                 self._turns.append(FindingTurn(finding=finding, outcome="escalating"))
                 detail, escalation = await self._escalate(spec, finding)
                 escalations.append(escalation)
                 status = "error" if "error" in escalation else "ok"
                 outcomes.append({"action": spec.name, "status": status, "detail": detail})
-                if escalation.get("findings"):
+                if any(outcome["status"] == "ok" for outcome in escalation.get("outcomes", [])):
                     fired = True
                 _log(f"watch {self.watch.name!r}: {finding.criterion} -> {spec.name} ({detail})")
                 continue
@@ -630,8 +667,6 @@ class WatchRunner:
             self._committed_position = chunk_position
             self._pending_cursor = None
 
-        cost = self._profile.cost_usd(result.input_tokens, result.cached_tokens, result.output_tokens)
-        self._spent_usd += cost
         record.update(
             latency_ms=result.latency_ms,
             input_tokens=result.input_tokens,
@@ -646,6 +681,8 @@ class WatchRunner:
         )
         if escalations:
             record["escalations"] = escalations
+        if fired and not self._pending_spool and self.watch.oneshot:
+            self.terminal_reason = "oneshot"
         self._write_decision(record)
         self._save_state()
         return fired and not self._pending_spool
@@ -684,6 +721,15 @@ class Engine:
         return registry_signature(self._config_path)
 
     async def run(self) -> None:
+        try:
+            await self._run()
+        finally:
+            for task in self._tasks.values():
+                task.cancel()
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+            self._write_status(alive=False)
+
+    async def _run(self) -> None:
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGUSR1, self._manual_all)
         loop.add_signal_handler(signal.SIGHUP, self._request_reload)
@@ -714,11 +760,13 @@ class Engine:
             for name, task in list(self._tasks.items()):
                 if not task.done():
                     continue
-                runner = self._runners.pop(name, None)
+                runner = self._runners.get(name)
                 self._tasks.pop(name)
                 exc = task.exception()
                 terminal = runner.terminal_reason if runner else None
                 if exc is not None:
+                    if not self._daemon:
+                        raise RuntimeError(f"watch {name!r} failed: {exc}") from exc
                     _log(f"watch {name!r} crashed: {exc!r}")
                 if self._daemon and terminal is None:
                     _log(f"watch {name!r}: not a terminal stop — restarting in {_RESTART_DELAY_SECONDS:.0f}s")
@@ -737,10 +785,6 @@ class Engine:
                 _log("all watches finished")
                 return
         _log("shutting down")
-        for task in self._tasks.values():
-            task.cancel()
-        await asyncio.gather(*self._tasks.values(), return_exceptions=True)
-        self._write_status(alive=False)
 
     def _judge_for(self, profile_name: str) -> Judge:
         if profile_name not in self._judges:
@@ -783,7 +827,13 @@ class Engine:
         for name in list(self._retry_at):
             if name not in wanted:
                 del self._retry_at[name]
+        for name in list(self._runners):
+            if name not in wanted:
+                self._runners.pop(name)
         for name, watch in wanted.items():
+            previous = self._runners.get(name)
+            if previous is not None and previous.terminal_reason is not None and previous.fingerprint == self._fingerprint(watch):
+                continue
             if name not in self._tasks and name not in self._retry_at:
                 self._start_runner(watch)
 
@@ -796,6 +846,8 @@ class Engine:
                 watch, self._config, self._judge_for, state_path, self._fingerprint(watch)
             )
         except Exception as exc:
+            if not self._daemon:
+                raise
             # One broken watch (missing key, bad profile) must not stop the rest.
             _log(f"watch {watch.name!r} failed to start ({exc}); retrying in {_INIT_RETRY_SECONDS:.0f}s")
             self._retry_at[watch.name] = time.monotonic() + _INIT_RETRY_SECONDS

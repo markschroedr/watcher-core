@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
 import signal
 import sys
@@ -28,11 +29,13 @@ async def _tail_file(
     handle = None
     inode: int | None = None
     first_open = True
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     try:
         while True:
             if handle is None:
                 try:
-                    handle = path.open("r", encoding="utf-8", errors="replace")
+                    handle = path.open("rb")
+                    decoder.reset()
                 except FileNotFoundError:
                     await asyncio.sleep(_POLL_SECONDS)
                     continue
@@ -65,9 +68,11 @@ async def _tail_file(
 
             data = handle.read(65536)
             if data:
+                text = decoder.decode(data)
                 if state is not None:
-                    state["position"] = handle.tell()
-                yield data
+                    state["position"] = handle.tell() - len(decoder.getstate()[0])
+                if text:
+                    yield text
                 continue
 
             # Detect truncation (size below our position) and rotation (new inode).
@@ -78,11 +83,6 @@ async def _tail_file(
                 handle = None
                 await asyncio.sleep(_POLL_SECONDS)
                 continue
-            if stat.st_size < handle.tell():
-                handle.seek(0)
-                if state is not None:
-                    state["position"] = 0
-                continue
             if stat.st_ino != inode:
                 handle.close()
                 handle = None
@@ -90,6 +90,12 @@ async def _tail_file(
                     state.pop("inode", None)
                     state.pop("position", None)
                     state.pop("start_position", None)
+                continue
+            if stat.st_size < handle.tell():
+                handle.seek(0)
+                decoder.reset()
+                if state is not None:
+                    state.update(position=0, start_position=0)
                 continue
             await asyncio.sleep(_POLL_SECONDS)
     finally:
@@ -107,40 +113,53 @@ async def _stream_command(argv: list[str]) -> AsyncIterator[str]:
         start_new_session=True,
     )
     assert process.stdout is not None
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     try:
         while True:
             chunk = await process.stdout.read(65536)
             if not chunk:
-                await process.wait()
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    yield tail
+                code = await process.wait()
+                if code:
+                    raise RuntimeError(f"source command exited with status {code}")
                 return
-            yield chunk.decode("utf-8", errors="replace")
+            text = decoder.decode(chunk)
+            if text:
+                yield text
     finally:
-        if process.returncode is None:
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
+        # The session leader may already have exited while children still own
+        # the output pipe. Its PID remains the process-group ID.
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
             try:
                 async with asyncio.timeout(5):
-                    await process.wait()
+                    while True:
+                        await asyncio.sleep(0.05)
+                        os.killpg(process.pid, 0)
             except TimeoutError:
-                # SIGTERM was trapped or ignored — do not hang shutdown forever.
-                try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                await process.wait()
+                os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
 
 
 async def _read_stdin() -> AsyncIterator[str]:
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
-    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
-    while True:
-        chunk = await reader.read(65536)
-        if not chunk:
-            return
-        yield chunk.decode("utf-8", errors="replace")
+    transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    try:
+        while True:
+            chunk = await reader.read(65536)
+            text = decoder.decode(chunk, final=not chunk)
+            if text:
+                yield text
+            if not chunk:
+                return
+    finally:
+        transport.close()
 
 
 def open_source(spec: SourceSpec, tail_chars: int, state: dict | None = None) -> AsyncIterator[str]:

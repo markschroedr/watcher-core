@@ -222,7 +222,7 @@ class Judge:
         verdicts = [
             json.loads(item.arguments) for item in response.output if item.type == "function_call"
         ]
-        confirmed = bool(verdicts and verdicts[0].get("confirmed"))
+        confirmed = bool(verdicts and verdicts[0].get("confirmed") is True)
         reason = verdicts[0].get("reason", "") if verdicts else "verifier returned no verdict"
         usage = response.usage
         cached = usage.input_tokens_details.cached_tokens if usage.input_tokens_details else 0
@@ -237,7 +237,7 @@ class Judge:
 
     async def _evaluate_responses(
         self, watch_name: str, criteria: list[Criterion], actions: list[ActionSpec], turns: list[Turn]
-    ) -> tuple[list[Finding], str, int, int, int, str | None]:
+    ) -> tuple[list[Finding], str, list[dict], int, int, int, str | None]:
         profile = self._profile
         kwargs: dict = {}
         if profile.reasoning_effort is not None:
@@ -309,7 +309,7 @@ class Judge:
 
     async def _evaluate_chat(
         self, watch_name: str, criteria: list[Criterion], actions: list[ActionSpec], turns: list[Turn]
-    ) -> tuple[list[Finding], str, int, int, int, str | None]:
+    ) -> tuple[list[Finding], str, list[dict], int, int, int, str | None]:
         profile = self._profile
         kwargs: dict = {}
         if profile.reasoning_effort is not None:

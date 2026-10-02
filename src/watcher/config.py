@@ -144,7 +144,7 @@ class SourceSpec(BaseModel):
 
 
 class WatchSpec(BaseModel):
-    name: str
+    name: str = Field(min_length=1, pattern=r"^[^/\\\x00]+$")
     generation: int | None = Field(default=None, gt=0)
     enabled: bool = True
     source: SourceSpec
@@ -159,6 +159,12 @@ class WatchSpec(BaseModel):
     # Budget threshold: the watch stops once spend has crossed this. The check
     # runs after each billable call, so one call may overshoot the threshold.
     max_cost_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _safe_name(self) -> "WatchSpec":
+        if self.name in (".", ".."):
+            raise ValueError("watch name must not be a path component")
+        return self
 
 
 class Config(BaseModel):

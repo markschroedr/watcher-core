@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from watcher.config import ConfigError
 
@@ -42,7 +43,7 @@ _SYSTEMD_UNIT = """[Unit]
 Description=watcher daemon (semantic stream watching)
 
 [Service]
-ExecStart={shell} -lc 'exec {binary} daemon --registry {registry}'
+ExecStart="{shell}" -lc "{command}"
 {environment_file}
 Restart=on-failure
 RestartSec=5
@@ -79,7 +80,7 @@ class _Launchd:
             command = f"set -a; . {shlex.quote(str(env_file))}; set +a; {command}"
         self.plist.write_text(
             _PLIST.format(
-                label=_LABEL, shell=_login_shell(), command=command, log=log,
+                label=_LABEL, shell=escape(_login_shell()), command=escape(command), log=escape(str(log)),
             ),
             encoding="utf-8",
         )
@@ -111,7 +112,8 @@ class _Systemd:
         self.unit.parent.mkdir(parents=True, exist_ok=True)
         self.unit.write_text(
             _SYSTEMD_UNIT.format(
-                shell=_login_shell(), binary=_binary(), registry=shlex.quote(str(registry)),
+                shell=_systemd_escape(_login_shell()),
+                command=_systemd_escape(shlex.join(["exec", _binary(), "daemon", "--registry", str(registry)])).replace("$", "$$"),
                 environment_file="" if env_file is None else f'EnvironmentFile="{_systemd_escape(str(env_file))}"',
             ),
             encoding="utf-8",
@@ -162,4 +164,4 @@ def status() -> str:
 
 
 def _systemd_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import yaml
+from pydantic import ValidationError
 
 from watcher.presets import LUNA_MODEL, LUNA_PRICES, PRESETS
 from watcher.config import (
@@ -227,6 +229,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 def _cmd_estimate(args: argparse.Namespace) -> int:
     from watcher.estimate import estimate
 
+    if not math.isfinite(args.usd_per_eur) or args.usd_per_eur <= 0:
+        raise ConfigError("usd-per-eur must be finite and greater than zero")
     config = load(args.config)
     watch = next((w for w in config.watches if w.name == args.watch), None)
     if watch is None:
@@ -492,9 +496,12 @@ def main() -> int:
     args = parser.parse_args()
     try:
         return args.func(args)
-    except ConfigError as exc:
+    except (ConfigError, ValidationError) as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+    except (OSError, RuntimeError) as exc:
+        print(f"watcher error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

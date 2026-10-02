@@ -15,6 +15,8 @@ above a 1024-token prefix, so tiny windows cost slightly more than estimated.
 
 from __future__ import annotations
 
+import math
+
 from pydantic import BaseModel
 
 from watcher.config import Config, ConfigError, WatchSpec
@@ -96,6 +98,12 @@ async def estimate(
     hours: float,
     evals_per_hour_override: float | None = None,
 ) -> Estimate:
+    for name, value in (("sample_seconds", sample_seconds), ("hours", hours),
+                        ("evals_per_hour", evals_per_hour_override)):
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ConfigError(f"{name} must be finite and greater than zero")
+    data_chars_per_hour = len(sample) / sample_seconds * 3600.0
+    evals_per_hour, is_ceiling = _evals_per_hour(watch, data_chars_per_hour, evals_per_hour_override)
     profile = config.profiles[watch.profile]
     if profile.price_input_per_mtok is None or profile.price_output_per_mtok is None:
         raise ConfigError(
@@ -116,9 +124,7 @@ async def estimate(
         raise ConfigError("sample too small to measure; provide a bigger sample")
     chars_per_token = len(sample) / sample_tokens
 
-    data_chars_per_hour = len(sample) / sample_seconds * 3600.0
     data_tokens_per_hour = data_chars_per_hour / chars_per_token
-    evals_per_hour, is_ceiling = _evals_per_hour(watch, data_chars_per_hour, evals_per_hour_override)
 
     price_in = profile.price_input_per_mtok / 1e6
     price_cached = (
@@ -153,8 +159,8 @@ async def estimate(
         sample_chars=len(sample),
         sample_input_tokens=sample_tokens,
         chars_per_token=chars_per_token,
-        output_tokens_noop=outputs["noop"],
-        output_tokens_hit=outputs["hit"],
+        output_tokens_noop=baseline.output_tokens,
+        output_tokens_hit=sampled.output_tokens,
         evals_per_hour=evals_per_hour,
         evals_per_hour_is_ceiling=is_ceiling,
         data_chars_per_hour=data_chars_per_hour,

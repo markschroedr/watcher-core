@@ -124,20 +124,22 @@ async def execute(
             async with asyncio.timeout(_COMMAND_TIMEOUT_SECONDS):
                 _, stderr = await process.communicate(payload.encode())
         except TimeoutError:
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.killpg(os.getpgid(process.pid), sig)
-                except (ProcessLookupError, PermissionError):
-                    break
+            return ActionOutcome(action=spec.name, status="error", detail="command timed out")
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
                 try:
                     async with asyncio.timeout(5):
-                        await process.wait()
-                    break
+                        while True:
+                            await asyncio.sleep(0.05)
+                            os.killpg(process.pid, 0)
                 except TimeoutError:
-                    continue
-            return ActionOutcome(action=spec.name, status="error", detail="command timed out")
+                    os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await process.wait()
         if process.returncode != 0:
-            return ActionOutcome(action=spec.name, status="error", detail=stderr.decode().strip())
+            return ActionOutcome(action=spec.name, status="error", detail=stderr.decode(errors="replace").strip() or f"command exited with status {process.returncode}")
         return ActionOutcome(action=spec.name, status="ok")
     except (OSError, RuntimeError, TimeoutError) as exc:
         return ActionOutcome(action=spec.name, status="error", detail=str(exc))
