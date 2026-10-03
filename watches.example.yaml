@@ -1,53 +1,49 @@
-log_dir: runs
-
-# `watcher presets` prints the canonical preset profiles and cadence.
-profiles:
-  eco:
-    model: gpt-6-luna
-    api: responses
-    reasoning_effort: medium
-    service_tier: flex
-    price_input_per_mtok: 0.05
-    price_cached_input_per_mtok: 0.005
-    price_output_per_mtok: 0.25
-  fast:
-    model: gpt-6-luna
-    api: responses
-    reasoning_effort: low
-    service_tier: priority
-    price_input_per_mtok: 0.20
-    price_cached_input_per_mtok: 0.02
-    price_output_per_mtok: 1.00
-  thorough:
-    model: gpt-6-luna
-    api: responses
-    reasoning_effort: high
-    service_tier: flex
-    price_input_per_mtok: 0.05
-    price_cached_input_per_mtok: 0.005
-    price_output_per_mtok: 0.25
-
-criteria:
-  - id: error-event
-    description: >
-      A line reports an error, failure, crash, or exception that a developer
-      would want to know about. Routine warnings, retries that succeed, and
-      successful requests do not count.
-
-actions:
-  - name: record
-    description: Record a finding so the user can review it later. Use for any matched criterion.
-    kind: log
-  - name: notify
-    description: Show a desktop notification. Use only for findings that need attention now.
-    kind: notify
-
+# Definitions only. Runtime progress and findings live in watcher.db beside this file.
+# Built-ins: eco, fast, thorough. sol is for escalation or confirmation.
 watches:
   - name: demo-log
     enabled: true
-    source: {type: file, path: runs/demo.log}
-    cadence: {preset: interval, every_seconds: 300}
-    profile: eco
-    criteria: [error-event]
-    actions: [record, notify]
+    generation: 1
+    preset: eco
+    source:
+      type: file
+      path: demo.log
+      # from_start: true
+      # start_inode: 12345
+      # start_position: 0
+    criteria:
+      - id: error-event
+        text: >
+          An error, failure, crash, or exception that a developer should investigate.
+          Routine warnings, successful retries, and successful requests do not count.
+    actions:
+      - name: record
+        kind: record
+        description: Record any matched criterion for later review.
+      - name: notify
+        kind: notify
+        description: Show a desktop notification for findings that need attention now.
+        repeat_every_seconds: 300
+    # escalate: sol
+    # A command action requires confirm: eco (or another preset).
+    # Command actions use fixed argv; finding JSON arrives on stdin.
+    # confirm: thorough
+    cadence: {every_seconds: 300, quiet_seconds: 10}
     window_max_chars: 65536
+    oneshot: false
+    max_cost_usd: 1.00
+    labels: {app: demo}
+
+# Add ordinary presets here, or in a watches.d/*.yaml fragment.
+# A preset with a built-in name replaces it. Set the whole shape, not just a field.
+# presets:
+#   slower:
+#     model: gpt-6-luna
+#     api_key_env: OPENAI_API_KEY
+#     reasoning_effort: medium
+#     service_tier: flex
+#     price_input_per_mtok: 0.05
+#     price_cached_input_per_mtok: 0.005
+#     price_output_per_mtok: 0.25
+#     cadence: {every_seconds: 600}
+#     window_max_chars: 65536
