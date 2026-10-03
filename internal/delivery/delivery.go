@@ -27,7 +27,7 @@ type Alert struct {
 	NextAt      float64  `json:"next_at"`
 	Attempts    int      `json:"attempts"`
 	LastError   string   `json:"last_error"`
-	DeliveredAt *float64 `json:"delivered_at"`
+	DeliveredAt *float64 `json:"delivered_at" jsonschema:"nullable"`
 }
 
 func Alerts(s *db.Store) ([]Alert, error) {

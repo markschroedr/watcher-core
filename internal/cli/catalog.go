@@ -40,8 +40,10 @@ func resultSchema(name string) map[string]any {
 		output = new(MutationResult)
 	case "status":
 		output = new(runner.Status)
-	case "findings", "watch":
+	case "findings":
 		output = new([]runner.Finding)
+	case "watch":
+		output = new(runner.Finding)
 	case "alerts":
 		output = new([]delivery.Alert)
 	case "ack":
@@ -154,9 +156,14 @@ func TypeScript(c EngineCatalog) string {
 	}
 	fmt.Fprintf(&out, "\nexport type CatalogResult = %s;\n", typeScriptType(Schema(new(EngineCatalog))))
 	fmt.Fprintln(&out, "\nexport interface Commands {")
-	for _, d := range all {
+	for _, d := range c.Commands {
 		fmt.Fprintf(&out, "%q: { input: %sInput; result: %sResult };\n", d.Name, names[d.Name], names[d.Name])
 	}
 	fmt.Fprintln(&out, "\"catalog\": { input: Record<string, never>; result: CatalogResult };\n}\nexport type Command = keyof Commands;")
+	fmt.Fprintln(&out, "\n// Operator commands use their CLI lifecycle; watch emits a stream of WatchResult rows.\nexport interface OperatorCommands {")
+	for _, d := range c.Operators {
+		fmt.Fprintf(&out, "%q: { input: %sInput; result: %sResult };\n", d.Name, names[d.Name], names[d.Name])
+	}
+	fmt.Fprintln(&out, "}")
 	return out.String()
 }

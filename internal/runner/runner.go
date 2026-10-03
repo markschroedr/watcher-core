@@ -28,7 +28,7 @@ type Progress struct {
 	Revision       int64         `json:"revision"`
 	Spent          float64       `json:"spent_usd"`
 	Terminal       string        `json:"terminal_reason,omitempty"`
-	Generation     *int64        `json:"loaded_generation"`
+	Generation     *int64        `json:"loaded_generation" jsonschema:"nullable"`
 	State          string        `json:"state"`
 	Error          string        `json:"last_error,omitempty"`
 	Heartbeat      float64       `json:"heartbeat"`
@@ -38,7 +38,7 @@ type Finding struct {
 	Seq        int64             `json:"seq"`
 	ID         string            `json:"id"`
 	Watch      string            `json:"watch"`
-	Generation *int64            `json:"generation"`
+	Generation *int64            `json:"generation" jsonschema:"nullable"`
 	Criterion  string            `json:"criterion"`
 	Summary    string            `json:"summary"`
 	Evidence   string            `json:"evidence"`
@@ -101,7 +101,7 @@ func Record(s *db.Store, watch, fingerprint string, trimmed int) func(judge.Call
 			if e := db.Exec(conn, `INSERT INTO judgments(watch,phase,model,service_tier,request_id,usage_json,cost_usd,error,trimmed_unjudged_chars,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, watch, call.Phase, call.Model, call.Tier, call.RequestID, db.JSON(call.Usage), cost, call.Error, trimmed, db.Now()); e != nil {
 				return e
 			}
-			return db.Exec(conn, `UPDATE progress SET spent_usd=spent_usd+?,heartbeat=? WHERE watch=? AND fingerprint=?`, cost, db.Now(), watch, fingerprint)
+			return db.Exec(conn, `UPDATE progress SET heartbeat=? WHERE watch=? AND fingerprint=?`, db.Now(), watch, fingerprint)
 		})
 	}
 }
@@ -120,7 +120,7 @@ func Commit(s *db.Store, w config.Watch, p *Progress, cursor stream.Cursor, resu
 		}
 	}
 	e := s.Tx(func(conn *sql.Conn) error {
-		res, e := conn.ExecContext(context.Background(), `UPDATE progress SET cursor_json=?,turns_json=?,revision=revision+1,terminal_reason=?,state=?,last_error='',heartbeat=?,wake_seq=? WHERE watch=? AND fingerprint=? AND revision=?`, db.JSON(cursor), db.JSON(result.Turns), terminal, map[bool]string{true: "terminal", false: "running"}[terminal != ""], now, p.WakeSeq, w.Name, p.Fingerprint, p.Revision)
+		res, e := conn.ExecContext(context.Background(), `UPDATE progress SET cursor_json=?,turns_json=?,revision=revision+1,terminal_reason=?,state=?,last_error='',heartbeat=?,wake_seq=?,spent_usd=? WHERE watch=? AND fingerprint=? AND revision=?`, db.JSON(cursor), db.JSON(result.Turns), terminal, map[bool]string{true: "terminal", false: "running"}[terminal != ""], now, p.WakeSeq, p.Spent, w.Name, p.Fingerprint, p.Revision)
 		if e != nil {
 			return e
 		}
@@ -196,7 +196,7 @@ func Run(ctx context.Context, s *db.Store, c *config.Config, w config.Watch, out
 			state = "terminal"
 		}
 		saveErr := s.Tx(func(conn *sql.Conn) error {
-			return db.Exec(conn, `UPDATE progress SET state=?,last_error=?,heartbeat=? WHERE watch=? AND fingerprint=?`, state, detail, db.Now(), w.Name, p.Fingerprint)
+			return db.Exec(conn, `UPDATE progress SET state=?,last_error=?,heartbeat=?,spent_usd=? WHERE watch=? AND fingerprint=? AND revision=?`, state, detail, db.Now(), p.Spent, w.Name, p.Fingerprint, p.Revision)
 		})
 		if err == nil {
 			err = saveErr
@@ -209,53 +209,26 @@ func Run(ctx context.Context, s *db.Store, c *config.Config, w config.Watch, out
 		})
 	}
 	initial := func(cursor stream.Cursor) error {
-		e := s.Tx(func(conn *sql.Conn) error {
+		return s.Tx(func(conn *sql.Conn) error {
 			return db.Exec(conn, `UPDATE progress SET cursor_json=? WHERE watch=? AND fingerprint=? AND revision=?`, db.JSON(cursor), w.Name, p.Fingerprint, p.Revision)
 		})
-		return e
 	}
-	chunks := stream.Open(child, w.Source, w.Window, p.Cursor, initial)
-	source := chunks
-	defer func() {
-		cancel()
-		for range source {
-		}
-	}()
+	source := stream.Open(child, w.Source, w.Window, p.Cursor, initial)
+	buffered := consume(source, w.Window, p.Cursor)
+	defer func() { cancel(); <-buffered.done }()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	buffer := ""
-	cursor := p.Cursor
 	lastJudge := time.Now()
-	lastData := lastJudge
 	lastHeartbeat := lastJudge
 	retryAt := time.Time{}
 	failures := 0
-	trimmed := 0
-	ended := false
-	var sourceErr error
 	wake := false
 	wakeSeq := p.WakeSeq
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case chunk, ok := <-chunks:
-			if !ok {
-				chunks = nil
-				ended = true
-			} else if chunk.End {
-				ended = true
-				sourceErr = chunk.Err
-			} else {
-				buffer += chunk.Text
-				lastData = time.Now()
-				cursor = chunk.Cursor
-				n := utf8.RuneCountInString(buffer)
-				if n > w.Window {
-					trimmed += n - w.Window
-					buffer = judge.Suffix(buffer, w.Window)
-				}
-			}
+		case <-buffered.changed:
 		case <-ticker.C:
 		}
 		now := time.Now()
@@ -266,34 +239,32 @@ func Run(ctx context.Context, s *db.Store, c *config.Config, w config.Watch, out
 			}); e != nil {
 				return e
 			}
-			e = s.DB.QueryRow(`SELECT coalesce(max(seq),0) FROM wakes WHERE watch='' OR watch=?`, w.Name).Scan(&wakeSeq)
-			if e != nil {
+			if e = s.DB.QueryRow(`SELECT coalesce(max(seq),0) FROM wakes WHERE watch='' OR watch=?`, w.Name).Scan(&wakeSeq); e != nil {
 				return e
 			}
 			wake = wakeSeq > p.WakeSeq
 		}
-		if buffer == "" {
-			if ended {
-				if sourceErr != nil {
-					return sourceErr
-				}
-				return nil
+		current := buffered.peek()
+		if current.text == "" {
+			if current.ended {
+				return current.err
 			}
 			continue
 		}
-		due := wake || ended || utf8.RuneCountInString(buffer) >= w.Window || now.Sub(lastJudge).Seconds() >= w.Cadence.Every || (w.Cadence.Quiet > 0 && now.Sub(lastData).Seconds() >= w.Cadence.Quiet)
+		due := wake || current.ended || utf8.RuneCountInString(current.text) >= w.Window || now.Sub(lastJudge).Seconds() >= w.Cadence.Every || (w.Cadence.Quiet > 0 && now.Sub(current.lastData).Seconds() >= w.Cadence.Quiet)
 		if !due || now.Before(retryAt) {
 			continue
 		}
-		client := &judge.Client{Config: c, Spent: p.Spent, Record: Record(s, w.Name, p.Fingerprint, trimmed)}
-		turns := judge.Reanchor(p.Turns, buffer, w.Window)
-		result, judgeErr := client.Judge(ctx, w, turns)
+		part := buffered.take()
+		client := &judge.Client{Config: c, Spent: p.Spent, Record: Record(s, w.Name, p.Fingerprint, part.trimmed)}
+		result, judgeErr := client.Judge(ctx, w, judge.Reanchor(p.Turns, part.text, w.Window))
 		p.Spent = client.Spent
 		fmt.Fprintf(os.Stderr, "[watcher] %s judgment cost $%.8f; spent $%.8f\n", w.Name, sumCost(result.Calls), p.Spent)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if judgeErr != nil {
+			buffered.restore(part)
 			if w.MaxCost != nil && p.Spent >= *w.MaxCost {
 				p.Terminal = "budget"
 				return s.Tx(func(conn *sql.Conn) error {
@@ -311,14 +282,17 @@ func Run(ctx context.Context, s *db.Store, c *config.Config, w config.Watch, out
 			retryAt = time.Now().Add(delay)
 			fmt.Fprintf(os.Stderr, "[watcher] %s: %v; retry in %s\n", w.Name, judgeErr, delay)
 			if e = s.Tx(func(conn *sql.Conn) error {
-				return db.Exec(conn, `UPDATE progress SET last_error=? WHERE watch=?`, judgeErr.Error(), w.Name)
+				if e := db.Exec(conn, `UPDATE judgments SET error=? WHERE seq=(SELECT max(seq) FROM judgments WHERE watch=?)`, judgeErr.Error(), w.Name); e != nil {
+					return e
+				}
+				return db.Exec(conn, `UPDATE progress SET last_error=?,spent_usd=? WHERE watch=? AND fingerprint=? AND revision=?`, judgeErr.Error(), p.Spent, w.Name, p.Fingerprint, p.Revision)
 			}); e != nil {
 				return e
 			}
 			continue
 		}
 		p.WakeSeq = wakeSeq
-		rows, e := Commit(s, w, &p, cursor, result)
+		rows, e := Commit(s, w, &p, part.cursor, result)
 		if e != nil {
 			return e
 		}
@@ -329,19 +303,11 @@ func Run(ctx context.Context, s *db.Store, c *config.Config, w config.Watch, out
 				}
 			}
 		}
-		buffer = ""
-		trimmed = 0
 		wake = false
 		failures = 0
 		retryAt = time.Time{}
 		lastJudge = time.Now()
 		if p.Terminal != "" {
-			return nil
-		}
-		if ended {
-			if sourceErr != nil {
-				return sourceErr
-			}
 			return nil
 		}
 	}
@@ -405,8 +371,8 @@ func Findings(s *db.Store, since int64, watch string, labels []string) ([]Findin
 type WatchStatus struct {
 	Name             string  `json:"name"`
 	Enabled          bool    `json:"enabled"`
-	Generation       *int64  `json:"generation"`
-	LoadedGeneration *int64  `json:"loaded_generation"`
+	Generation       *int64  `json:"generation" jsonschema:"nullable"`
+	LoadedGeneration *int64  `json:"loaded_generation" jsonschema:"nullable"`
 	State            string  `json:"state"`
 	Terminal         string  `json:"terminal_reason,omitempty"`
 	Spent            float64 `json:"spent_usd"`

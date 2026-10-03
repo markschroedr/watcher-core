@@ -50,12 +50,12 @@ type Call struct {
 	Tier      string   `json:"service_tier"`
 	RequestID string   `json:"request_id"`
 	Usage     Usage    `json:"usage"`
-	Cost      *float64 `json:"cost_usd"`
+	Cost      *float64 `json:"cost_usd" jsonschema:"nullable"`
 	Error     string   `json:"error,omitempty"`
 }
 type Result struct {
 	Findings []Finding `json:"findings"`
-	Cost     *float64  `json:"cost_usd"`
+	Cost     *float64  `json:"cost_usd" jsonschema:"nullable"`
 	Calls    []Call    `json:"calls"`
 	Turns    []Turn    `json:"-"`
 	Budget   bool      `json:"budget_exhausted"`

@@ -29,6 +29,10 @@ func invalid(e error) error {
 	if e == nil {
 		return nil
 	}
+	var path *os.PathError
+	if errors.As(e, &path) {
+		return e
+	}
 	return validationError{e}
 }
 func Main(args []string) int {
@@ -40,7 +44,7 @@ func Main(args []string) int {
 	}
 	fmt.Fprintln(os.Stderr, "watcher:", e)
 	var v validationError
-	if errors.As(e, &v) {
+	if errors.As(e, &v) || errors.Is(e, syscall.EWOULDBLOCK) {
 		return 2
 	}
 	return 1
@@ -192,10 +196,10 @@ func execute(ctx context.Context, args []string) error {
 		}
 		client := &judge.Client{Config: c}
 		result, e := client.Judge(ctx, w, []judge.Turn{{Kind: "stream", Content: string(data)}})
+		fmt.Fprintf(os.Stderr, "[watcher] judge cost %s\n", db.JSON(result.Cost))
 		if e != nil {
 			return e
 		}
-		fmt.Fprintf(os.Stderr, "[watcher] judge cost %s\n", db.JSON(result.Cost))
 		return emit(result)
 	}
 	if name == "watch" {

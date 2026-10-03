@@ -23,9 +23,9 @@ type Preset struct {
 	APIKeyEnv string   `json:"api_key_env" yaml:"api_key_env"`
 	Effort    string   `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
 	Tier      string   `json:"service_tier,omitempty" yaml:"service_tier,omitempty"`
-	Input     *float64 `json:"price_input_per_mtok" yaml:"price_input_per_mtok"`
-	Cached    *float64 `json:"price_cached_input_per_mtok" yaml:"price_cached_input_per_mtok"`
-	Output    *float64 `json:"price_output_per_mtok" yaml:"price_output_per_mtok"`
+	Input     *float64 `json:"price_input_per_mtok" yaml:"price_input_per_mtok" jsonschema:"nullable"`
+	Cached    *float64 `json:"price_cached_input_per_mtok" yaml:"price_cached_input_per_mtok" jsonschema:"nullable"`
+	Output    *float64 `json:"price_output_per_mtok" yaml:"price_output_per_mtok" jsonschema:"nullable"`
 	Cadence   Cadence  `json:"cadence" yaml:"cadence"`
 	Window    int      `json:"window_max_chars" yaml:"window_max_chars"`
 }
@@ -318,6 +318,8 @@ func (c *Config) Resolve() error {
 		if w.MaxCost != nil && (!finite(*w.MaxCost) || *w.MaxCost <= 0) {
 			return fmt.Errorf("%s: max_cost_usd must be positive", w.Name)
 		}
+		enabled := w.IsEnabled()
+		w.Enabled = &enabled
 		c.Watches[i] = w
 	}
 	return nil
