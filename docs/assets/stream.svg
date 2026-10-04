@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 250" width="760" height="250" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <style>
+    .g { stroke: #8b949e; }
+    .a { stroke: #d39b52; }
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #8b949e; }
+    .t { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+    .s { font-size: 11.5px; opacity: .8; }
+  </style>
+
+  <!-- the stream, cut into batches by the interval -->
+  <g stroke-width="2">
+    <line class="g" x1="40" y1="40" x2="160" y2="40" opacity=".55"/>
+    <line class="g" x1="40" y1="56" x2="210" y2="56" opacity=".55"/>
+    <line class="g" x1="40" y1="72" x2="180" y2="72" opacity=".55"/>
+    <line class="g" x1="40" y1="102" x2="200" y2="102" opacity=".55"/>
+    <line class="g" x1="40" y1="118" x2="150" y2="118" opacity=".55"/>
+    <line class="g" x1="40" y1="134" x2="190" y2="134" opacity=".55"/>
+    <line class="g" x1="40" y1="164" x2="170" y2="164" opacity=".55"/>
+    <line class="a" x1="40" y1="180" x2="215" y2="180" stroke-width="2.6"/>
+    <line class="g" x1="40" y1="196" x2="160" y2="196" opacity=".55"/>
+  </g>
+  <g stroke-width="1.2" opacity=".35">
+    <line class="g" x1="32" y1="87" x2="226" y2="87" stroke-dasharray="3 5"/>
+    <line class="g" x1="32" y1="149" x2="226" y2="149" stroke-dasharray="3 5"/>
+  </g>
+  <text class="t" x="40" y="232">stream</text>
+  <text class="s" x="96" y="232">batched per interval</text>
+
+  <!-- batches flow into the judge -->
+  <g stroke-width="1.6" opacity=".7">
+    <path class="g" d="M236 56 C 280 56, 290 104, 326 110" stroke-dasharray="1 5"/>
+    <path class="g" d="M236 118 C 270 118, 290 118, 326 118" stroke-dasharray="1 5"/>
+    <path class="a" d="M236 180 C 280 180, 290 132, 326 126" stroke-dasharray="1 5"/>
+  </g>
+
+  <!-- the judge holds the criteria -->
+  <g stroke-width="2">
+    <rect class="g" x="330" y="84" width="96" height="68" rx="10" opacity=".6" stroke-width="1.6"/>
+    <line class="g" x1="346" y1="104" x2="408" y2="104" opacity=".7"/>
+    <line class="g" x1="346" y1="118" x2="396" y2="118" opacity=".7"/>
+    <line class="g" x1="346" y1="132" x2="402" y2="132" opacity=".7"/>
+  </g>
+  <text class="t" x="330" y="232">judge</text>
+  <text class="s" x="372" y="232">your criteria</text>
+
+  <!-- most batches end in silence -->
+  <g stroke-width="1.6">
+    <path class="g" d="M430 110 C 466 104, 470 56, 506 56" stroke-dasharray="1 5" opacity=".45"/>
+    <path class="g" d="M430 118 C 466 118, 476 118, 506 118" stroke-dasharray="1 5" opacity=".45"/>
+    <circle class="g" cx="514" cy="56" r="3.5" opacity=".45"/>
+    <circle class="g" cx="514" cy="118" r="3.5" opacity=".45"/>
+  </g>
+  <text class="s" x="528" y="60" opacity=".55">noop</text>
+  <text class="s" x="528" y="122" opacity=".55">noop</text>
+
+  <!-- one batch becomes a finding -->
+  <path class="a" d="M430 126 C 466 132, 470 180, 504 180" stroke-width="1.6" stroke-dasharray="1 5"/>
+  <g stroke-width="2">
+    <rect class="a" x="510" y="156" width="210" height="50" rx="8" stroke-width="1.6"/>
+    <line class="a" x1="526" y1="173" x2="680" y2="173" stroke-width="2.6"/>
+    <line class="g" x1="526" y1="190" x2="640" y2="190" opacity=".55"/>
+  </g>
+  <text class="t" x="510" y="232">finding</text>
+  <text class="s" x="566" y="232">silence is the default</text>
+</svg>

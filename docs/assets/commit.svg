@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 250" width="760" height="250" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <style>
+    .g { stroke: #8b949e; }
+    .a { stroke: #d39b52; }
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #8b949e; }
+    .t { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+    .s { font-size: 11.5px; opacity: .8; }
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+  </style>
+
+  <!-- stream with a cursor: judged on the left, new on the right -->
+  <g stroke-width="3">
+    <line class="g" x1="40" y1="66" x2="148" y2="66" opacity=".7"/>
+    <line class="g" x1="160" y1="66" x2="240" y2="66" opacity=".4" stroke-dasharray="6 6"/>
+  </g>
+  <line class="a" x1="154" y1="52" x2="154" y2="80" stroke-width="2.6"/>
+  <text class="s" x="40" y="44" opacity=".6">judged</text>
+  <text class="s" x="190" y="44" opacity=".6">new</text>
+
+  <!-- the conversation: stream turns and earlier findings -->
+  <g stroke-width="2">
+    <line class="g" x1="40" y1="112" x2="170" y2="112" opacity=".55"/>
+    <line class="g" x1="64" y1="128" x2="150" y2="128" opacity=".55"/>
+    <line class="a" x1="64" y1="144" x2="140" y2="144" stroke-width="2.4"/>
+    <line class="g" x1="40" y1="160" x2="190" y2="160" opacity=".55"/>
+  </g>
+  <text class="t" x="40" y="232">watch</text>
+  <text class="s" x="86" y="232">cursor and conversation</text>
+
+  <!-- both feed one transaction -->
+  <g stroke-width="1.5" opacity=".7">
+    <path class="g" d="M248 66 C 270 66, 272 82, 296 84" stroke-dasharray="1 5"/>
+    <path class="g" d="M200 136 C 240 136, 260 120, 296 118" stroke-dasharray="1 5"/>
+  </g>
+  <g stroke-width="2">
+    <rect class="a" x="300" y="44" width="140" height="128" rx="12" stroke-width="1.4" stroke-dasharray="5 5" opacity=".8"/>
+    <line class="g" x1="318" y1="84" x2="404" y2="84" opacity=".7"/>
+    <path class="g" d="M398 79 L405 84 L398 89" stroke-width="1.6" opacity=".7"/>
+    <line class="a" x1="318" y1="114" x2="420" y2="114" stroke-width="2.6"/>
+    <line class="g" x1="318" y1="142" x2="384" y2="142" opacity=".55"/>
+  </g>
+  <text class="t" x="300" y="232">commit</text>
+  <text class="s" x="352" y="232">all or nothing</text>
+
+  <!-- the findings log -->
+  <path class="a" d="M444 114 C 466 114, 470 132, 486 134" stroke-width="1.5" stroke-dasharray="1 5"/>
+  <g stroke-width="1.4">
+    <rect class="g" x="490" y="56" width="110" height="18" rx="4" opacity=".45"/>
+    <rect class="g" x="490" y="82" width="110" height="18" rx="4" opacity=".45"/>
+    <rect class="g" x="490" y="108" width="110" height="18" rx="4" opacity=".45"/>
+    <rect class="a" x="490" y="134" width="110" height="18" rx="4"/>
+  </g>
+  <text class="m" x="500" y="69" opacity=".6">41</text>
+  <text class="m" x="500" y="95" opacity=".6">42</text>
+  <text class="m" x="500" y="121" opacity=".6">43</text>
+  <text class="m" x="500" y="147" style="fill:#d39b52">44</text>
+  <g stroke-width="2" opacity=".5">
+    <line class="g" x1="526" y1="65" x2="586" y2="65"/>
+    <line class="g" x1="526" y1="91" x2="576" y2="91"/>
+    <line class="g" x1="526" y1="117" x2="582" y2="117"/>
+  </g>
+  <line class="a" x1="526" y1="143" x2="588" y2="143" stroke-width="2"/>
+  <text class="t" x="490" y="232">findings</text>
+  <text class="s" x="552" y="232">numbered</text>
+
+  <!-- consumers read from the log -->
+  <g stroke-width="1.5" opacity=".7">
+    <path class="g" d="M604 143 C 626 143, 624 76, 646 76" stroke-dasharray="1 5"/>
+    <path class="g" d="M604 143 C 626 143, 628 122, 646 122" stroke-dasharray="1 5"/>
+    <path class="g" d="M604 143 C 626 143, 628 168, 646 168" stroke-dasharray="1 5"/>
+  </g>
+  <text class="m" x="654" y="80">--since 43</text>
+  <text class="m" x="654" y="126">notify</text>
+  <text class="m" x="654" y="172">command</text>
+</svg>
