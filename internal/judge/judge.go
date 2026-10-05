@@ -79,22 +79,33 @@ type response struct {
 	} `json:"error"`
 }
 
+// call sends one request. A Flex request that the provider rejects as overloaded or fails on its side is sent once
+// more on the standard tier, so a busy Flex pool delays nothing; both attempts are recorded.
 func (c *Client) call(ctx context.Context, p config.Preset, phase, watch, instructions string, input any, tools []any, choice any) (response, error) {
+	result, status, e := c.request(ctx, p, p.Tier, phase, watch, instructions, input, tools, choice)
+	if e != nil && p.Tier == "flex" && (status == http.StatusTooManyRequests || status >= 500) && ctx.Err() == nil {
+		result, _, e = c.request(ctx, p, "default", phase, watch, instructions, input, tools, choice)
+	}
+	return result, e
+}
+
+func (c *Client) request(ctx context.Context, p config.Preset, tier, phase, watch, instructions string, input any, tools []any, choice any) (response, int, error) {
 	var result response
-	call := Call{Phase: phase, Model: p.Model, Tier: p.Tier}
+	status := 0
+	call := Call{Phase: phase, Model: p.Model, Tier: tier}
 	body := map[string]any{"model": p.Model, "store": false, "prompt_cache_key": "watcher:" + watch, "include": []string{"reasoning.encrypted_content"}, "instructions": instructions, "input": input, "tools": tools}
 	if p.Effort != "" {
 		body["reasoning"] = map[string]string{"effort": p.Effort}
 	}
-	if p.Tier != "" {
-		body["service_tier"] = p.Tier
+	if tier != "" {
+		body["service_tier"] = tier
 	}
 	if choice != nil {
 		body["tool_choice"] = choice
 	}
 	key := os.Getenv(p.APIKeyEnv)
 	if key == "" {
-		return result, fmt.Errorf("environment variable %s is not set", p.APIKeyEnv)
+		return result, status, fmt.Errorf("environment variable %s is not set", p.APIKeyEnv)
 	}
 	base := strings.TrimRight(p.BaseURL, "/")
 	if base == "" {
@@ -102,17 +113,18 @@ func (c *Client) call(ctx context.Context, p config.Preset, phase, watch, instru
 	}
 	data, e := json.Marshal(body)
 	if e != nil {
-		return result, e
+		return result, status, e
 	}
 	req, e := http.NewRequestWithContext(ctx, "POST", base+"/responses", bytes.NewReader(data))
 	if e != nil {
-		return result, e
+		return result, status, e
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 15 * time.Minute}
 	res, e := client.Do(req)
 	if e == nil {
+		status = res.StatusCode
 		call.RequestID = res.Header.Get("x-request-id")
 		b, readErr := io.ReadAll(res.Body)
 		res.Body.Close()
@@ -161,10 +173,10 @@ func (c *Client) call(ctx context.Context, p config.Preset, phase, watch, instru
 	c.Calls = append(c.Calls, call)
 	if c.Record != nil {
 		if recordErr := c.Record(call); recordErr != nil {
-			return result, recordErr
+			return result, status, recordErr
 		}
 	}
-	return result, e
+	return result, status, e
 }
 func parameters(criteria []config.Criterion) map[string]any {
 	ids := []string{}
